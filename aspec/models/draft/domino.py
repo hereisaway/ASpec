@@ -43,6 +43,8 @@ class DominoConfig(DFlashConfig):
             pure_draft_prefix_len, int
         ):
             raise ValueError("Domino pure_draft_prefix_len must be an integer")
+        if pure_draft_prefix_len < 0:
+            raise ValueError("Domino pure_draft_prefix_len must be non-negative")
         if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 2:
             raise ValueError("Domino block_size must be an integer >= 2")
         suffix_start = pure_draft_prefix_len if shift_label else 1 + pure_draft_prefix_len

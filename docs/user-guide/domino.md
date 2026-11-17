@@ -67,10 +67,12 @@ loss = (1 - lambda_base) * CE(corrected logits, labels)
 
 `lambda_base` is an explicit per-step value in `[0, 1]`; use
 `model.set_lambda_base(value)` from a trainer-owned curriculum. `lambda_base=1`
-recovers the plain DFlash backbone objective exactly (the correction head receives
-no useful gradient). Anchor sampling, block masks, label bounds, `loss_mask` and
-DFlash-style exponential depth decay are reused; `ce_loss_alpha=1` and
-`l1_loss_alpha=0` are enforced. Reporting accuracy and per-position loss use the
+removes the correction contribution and keeps the selected label layout (the
+correction head receives no useful gradient). It equals the plain DFlash objective
+only for the unshifted layout (`shift_label=false`) with otherwise matching
+weighting settings; the shifted layout supervises different slots. Anchor sampling,
+block masks, label bounds, `loss_mask` and DFlash-style exponential depth decay are
+reused; `ce_loss_alpha=1` and `l1_loss_alpha=0` are enforced. Reporting accuracy and per-position loss use the
 corrected logits, while the returned loss applies the DFlash objective weights.
 
 ## Minimal numerical use

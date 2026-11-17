@@ -191,6 +191,8 @@ def test_config_pins_the_correction_contract():
     {"gru_hidden_dim": -1},
     {"shift_label": 1},
     {"pure_draft_prefix_len": 1.5},
+    {"pure_draft_prefix_len": -1},
+    {"shift_label": False, "pure_draft_prefix_len": -1},
     {"shift_label": False, "pure_draft_prefix_len": 4},
     {"architectures": ["DFlashDraftModel"]},
     {"is_causal": True},
