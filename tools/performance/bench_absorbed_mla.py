@@ -20,7 +20,9 @@ tensors, BF16, no dense mask). It compares:
 
 - ``materialized_sdpa``: expand ``kv_b_proj`` and call fused SDPA;
 - ``materialized_explicit``: expand ``kv_b_proj`` and materialize logits;
-- ``absorbed``: keep the normalized latent and re-associate both projections.
+- ``absorbed``: keep the normalized latent and re-associate both projections;
+- ``absorbed_fused``: the same absorbed identity with the fused Triton
+  score/softmax/latent core (when Triton and CUDA are available).
 
 FlexAttention/cuDNN masks, packed layouts and Direct-CP are outside this
 benchmark. Report the boundary together with the result; this does not establish
@@ -41,6 +43,10 @@ import torch
 import torch.nn.functional as F
 
 from aspec.models.ops.absorbed_mla import absorbed_mla_attention
+from aspec.models.ops.absorbed_mla_fused import (
+    _HAS_TRITON,
+    fused_absorbed_mla_attention,
+)
 
 
 @dataclass(frozen=True)
@@ -164,6 +170,14 @@ def absorbed(tensors, workload: Workload):
     )
 
 
+def absorbed_fused(tensors, workload: Workload):
+    return fused_absorbed_mla_attention(
+        tensors["q_nope"], tensors["q_rope"], tensors["compressed_kv"],
+        tensors["k_rope"], tensors["kv_b_proj_weight"],
+        softmax_scale=workload.softmax_scale,
+    )
+
+
 def run_step(fn, tensors, workload):
     output = fn(tensors, workload)
     loss = output.float().pow(2).sum()
@@ -238,6 +252,8 @@ def main(argv=None) -> int:
         "materialized_explicit": materialized_explicit,
         "absorbed": absorbed,
     }
+    if _HAS_TRITON:
+        variants["absorbed_fused"] = absorbed_fused
     results = {
         "workload": asdict(workload) | {
             "query_length": workload.query_length,
