@@ -145,12 +145,13 @@ def absorbed_mla_attention(
             raise ValueError(
                 "attn_mask must broadcast against [B, H, S, T]"
             ) from exc
-        if not mask.any(dim=-1).all():
-            raise ValueError(
-                "attn_mask must leave at least one visible key per query"
-            )
         scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-    probs = torch.softmax(scores.float(), dim=-1).to(dtype)
+    probs = torch.softmax(scores.float(), dim=-1)
+    if attn_mask is not None:
+        # Match fused SDPA: rows with no visible key contribute zero, not a
+        # uniform average over the finite masked scores.
+        probs = probs * mask.any(dim=-1, keepdim=True)
+    probs = probs.to(dtype)
     out_latent = torch.einsum("bhst,btk->bshk", probs, compressed_kv)
     output = torch.einsum("bshk,hvk->bshv", out_latent, w_uv)
     return output.reshape(batch, query_len, num_heads * inferred_v_head_dim)

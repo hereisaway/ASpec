@@ -54,8 +54,12 @@ def reference_materialized(
     scores = scores + torch.einsum("bshr,btr->bhst", q_rope, k_rope)
     scores = scores * softmax_scale
     if attn_mask is not None:
-        scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
-    probs = torch.softmax(scores.float(), dim=-1).to(q_nope.dtype)
+        mask = attn_mask.expand(scores.shape)
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+    probs = torch.softmax(scores.float(), dim=-1)
+    if attn_mask is not None:
+        probs = probs * mask.any(dim=-1, keepdim=True)
+    probs = probs.to(q_nope.dtype)
     output = torch.einsum("bhst,bthv->bshv", probs, values)
     return output.reshape(batch, query, heads * value)
 
@@ -168,12 +172,19 @@ def test_dense_mask_excludes_hidden_keys():
     torch.testing.assert_close(moved, actual, rtol=0, atol=0)
 
 
-def test_fully_masked_rows_fail_closed():
+def test_fully_masked_rows_have_zero_output_and_gradient():
     tensors = make_tensors()
+    for value in tensors.values():
+        value.requires_grad_(True)
     mask = torch.ones(1, 2, 4, 7, dtype=torch.bool)
     mask[:, :, :2] = False
-    with pytest.raises(ValueError, match="visible key"):
-        absorbed_mla_attention(**tensors, attn_mask=mask)
+    output = absorbed_mla_attention(**tensors, attn_mask=mask)
+    assert torch.count_nonzero(output[:, :2]) == 0
+    grads = torch.autograd.grad(output.float().pow(2).sum(), list(tensors.values()))
+    q_nope_grad = grads[0]
+    assert torch.count_nonzero(q_nope_grad[:, :2]) == 0
+    expected = reference_materialized(**tensors, attn_mask=mask)
+    torch.testing.assert_close(output, expected, rtol=2e-6, atol=2e-6)
 
 
 def test_mask_broadcasts_over_batch_and_heads():

@@ -170,31 +170,43 @@ def run_step(fn, tensors, workload):
     return torch.autograd.grad(loss, list(tensors.values()))
 
 
-def measure(fn, tensors, workload, *, warmup: int, runs: int):
-    leaves = list(tensors.values())
-    for _ in range(warmup):
-        run_step(fn, tensors, workload)
+def measure_variants(variants, tensors, workload, *, warmup: int, runs: int):
+    """Time each variant in rotating order and record per-round raw samples."""
+    names = list(variants)
+    for round_index in range(warmup):
+        order = names[round_index % len(names):] + names[: round_index % len(names)]
+        for name in order:
+            run_step(variants[name], tensors, workload)
     torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    samples = []
-    for _ in range(runs):
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        run_step(fn, tensors, workload)
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end))
-    for leaf in leaves:
-        leaf.grad = None
-    return {
-        "median_ms": statistics.median(samples),
-        "min_ms": min(samples),
-        "max_ms": max(samples),
-        "samples_ms": samples,
-        "peak_memory_bytes": torch.cuda.max_memory_allocated(),
-    }
+    samples = {name: [] for name in names}
+    peaks = {name: [] for name in names}
+    orders = []
+    for round_index in range(runs):
+        offset = round_index % len(names)
+        order = names[offset:] + names[:offset]
+        orders.append(order)
+        for name in order:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            run_step(variants[name], tensors, workload)
+            end.record()
+            end.synchronize()
+            samples[name].append(start.elapsed_time(end))
+            peaks[name].append(torch.cuda.max_memory_allocated())
+    results = {}
+    for name in names:
+        results[name] = {
+            "median_ms": statistics.median(samples[name]),
+            "min_ms": min(samples[name]),
+            "max_ms": max(samples[name]),
+            "samples_ms": samples[name],
+            "peak_memory_samples_bytes": peaks[name],
+            "peak_memory_bytes": max(peaks[name]),
+        }
+    return results, orders
 
 
 def main(argv=None) -> int:
@@ -237,11 +249,13 @@ def main(argv=None) -> int:
         "boundary": "attention core, dense unmasked, forward+backward, no o_proj",
         "variants": {},
     }
-    for name, fn in variants.items():
-        results["variants"][name] = measure(
-            fn, tensors, workload, warmup=args.warmup, runs=args.runs
-        )
-        print(name, json.dumps(results["variants"][name]))
+    measured, orders = measure_variants(
+        variants, tensors, workload, warmup=args.warmup, runs=args.runs
+    )
+    results["variant_order"] = orders
+    results["variants"] = measured
+    for name, value in measured.items():
+        print(name, json.dumps(value))
     if args.result:
         args.result.write_text(json.dumps(results, indent=2) + "\n")
     return 0

@@ -33,11 +33,13 @@ for `q_lora_rank` on/off: those projections happen before this boundary.
 ## Scope of the prototype
 
 `aspec.models.ops.absorbed_mla.absorbed_mla_attention` implements the dense,
-unmasked-or-boolean-mask case in PyTorch. `tests/cpu/test_absorbed_mla.py` checks:
+unmasked-or-boolean-mask case in PyTorch. Empty mask rows produce zero output and
+zero gradient, matching fused SDPA. `tests/cpu/test_absorbed_mla.py` checks:
 
 - forward parity against an explicitly materialized reference;
 - gradients of both query sides, `c_kv`, `k_rope` and `kv_b_proj.weight`;
-- dense masks (including broadcast masks that hide keys) and short sequences;
+- dense masks (including broadcast masks that hide keys and empty rows) and
+  short sequences;
 - parity with the retained `K3DSparkMLAAttention` projections and softmax scale.
 
 FlexAttention/cuDNN masks, packed THD layouts, Direct-CP, `o_proj` fusion and
@@ -53,14 +55,15 @@ the absorbed path. No mask, `o_proj`, Target capture or optimizer step is includ
 
 Measured on 8x H100 PCIe 80GB, driver 580.126.09, PyTorch 2.13.0+cu130, BF16,
 warmup 1, 3 runs, median. Peak memory is `torch.cuda.max_memory_allocated()` for
-forward+backward.
+forward+backward. Variants run in rotating order per round; the tool records each
+round's order and the per-round timings and peaks in the JSON result.
 
 | anchors | `S` | `T` | materialized SDPA | materialized explicit | absorbed |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 7 | 4103 | 2.51 ms / 0.240 GiB | 3.27 ms / 0.184 GiB | 3.80 ms / 0.101 GiB |
-| 8 | 56 | 4152 | 2.55 ms / 0.250 GiB | 3.23 ms / 0.260 GiB | 3.24 ms / 0.220 GiB |
-| 128 | 896 | 4992 | 3.17 ms / 0.350 GiB | 9.20 ms / 2.32 GiB | 10.64 ms / 2.80 GiB |
-| 512 | 3584 | 7680 | 9.46 ms / 0.670 GiB | 51.24 ms / 13.41 GiB | 63.46 ms / 16.69 GiB |
+| 1 | 7 | 4103 | 3.38 ms / 0.240 GiB | 4.02 ms / 0.184 GiB | 4.32 ms / 0.101 GiB |
+| 8 | 56 | 4152 | 3.26 ms / 0.245 GiB | 3.60 ms / 0.258 GiB | 3.91 ms / 0.225 GiB |
+| 128 | 896 | 4992 | 3.02 ms / 0.348 GiB | 9.04 ms / 2.315 GiB | 10.49 ms / 2.799 GiB |
+| 512 | 3584 | 7680 | 9.14 ms / 0.668 GiB | 51.50 ms / 13.411 GiB | 63.11 ms / 16.688 GiB |
 
 `S` is `num_anchors * block_size`; `T = context_length + S`.
 
@@ -81,9 +84,9 @@ select this PyTorch build's bundled cuDNN on the measurement host.
 For the default draft anchor budget (512 anchors, 3584 queries), the naive absorbed
 path is both slower and larger than the retained fused-SDPA path: explicit logits
 dominate memory, and `q_lat` has `kv_lora_rank=512` versus the materialized
-`qk_nope_head_dim=128`, so the score matmul does more work. Only the tiny-query
-regime (1 anchor, 7 queries) reduces peak activation memory (0.101 vs 0.240 GiB),
-and even there it is slower.
+`qk_nope_head_dim=128`, so the score matmul does more work. The tiny-query
+regimes (1 or 8 anchors) do reduce peak activation memory (0.101 vs 0.240 GiB at
+one anchor, 0.225 vs 0.245 GiB at eight), but both are slower.
 
 **Recommendation:** do not integrate the naive PyTorch absorbed form into maintained
 draft training, and do not claim a training speedup. A useful follow-up would need
