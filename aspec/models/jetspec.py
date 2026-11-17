@@ -87,8 +87,8 @@ class JetSpecModel(DFlashModel):
         with torch.no_grad():
             target_logits = F.linear(
                 aligned_hidden.detach(), lm_head_weight.detach()
-            ).float()
-        draft_logits = logits.float()
+            ).float().reshape(-1, logits.size(-1))
+        draft_logits = logits.float().reshape(-1, logits.size(-1))
         temperature = self.distillation_temperature
         log_q = F.log_softmax(draft_logits / temperature, dim=-1)
         p = F.softmax(target_logits / temperature, dim=-1)

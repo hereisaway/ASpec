@@ -44,17 +44,17 @@ def make_model(*, temperature=1.0, loss_decay_gamma=0.0, seed=17, **config_overr
     )
 
 
-def make_inputs(seed=31, length=12):
+def make_inputs(seed=31, length=12, batch=1):
     generator = torch.Generator().manual_seed(seed)
-    ids = torch.arange(length)[None]
+    ids = (torch.arange(batch * length).reshape(batch, length) % 32)
     return dict(
         input_ids=ids,
-        hidden_states_list=torch.randn(1, length, 16, generator=generator),
+        hidden_states_list=torch.randn(batch, length, 16, generator=generator),
         loss_mask=torch.ones_like(ids),
         lm_head_weight=torch.randn(32, 16, generator=generator),
-        last_hidden_states=torch.randn(1, length, 16, generator=generator),
-        injected_anchors=torch.tensor([[3, 5]]),
-        injected_keep_mask=torch.ones(1, 2, dtype=torch.bool),
+        last_hidden_states=torch.randn(batch, length, 16, generator=generator),
+        injected_anchors=torch.tensor([[3, 5]]).expand(batch, -1),
+        injected_keep_mask=torch.ones(batch, 2, dtype=torch.bool),
     )
 
 
@@ -83,7 +83,7 @@ def reference_kl(model, draft_hidden, inputs):
     teacher_positions = (safe_indices - 1).clamp(min=0)
     teacher_hidden = torch.gather(
         inputs["last_hidden_states"].detach(), 1,
-        teacher_positions.reshape(1, -1, 1).expand(-1, -1, 16),
+        teacher_positions.reshape(ids.shape[0], -1, 1).expand(-1, -1, 16),
     )
     target_logits = F.linear(teacher_hidden, inputs["lm_head_weight"].detach()).float()
     draft_logits = F.linear(draft_hidden, inputs["lm_head_weight"]).float()
@@ -204,6 +204,62 @@ def test_loss_and_gradients_match_independent_equations(temperature, loss_decay_
     _assert_parameter_gradients(actual, reference)
 
 
+def test_two_row_forward_kl_matches_reference_and_backward():
+    actual = make_model(temperature=1.5)
+    reference = copy.deepcopy(actual)
+    inputs, reference_inputs = make_inputs(batch=2), make_inputs(batch=2)
+    result, _ = run_and_capture(actual, inputs)
+    expected, reference_captured = run_and_capture(reference, reference_inputs)
+    expected_loss, _ = reference_kl(reference, reference_captured, reference_inputs)
+    assert result[0].ndim == 0
+    torch.testing.assert_close(result[0], expected[0], rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(expected_loss, expected[0], rtol=2e-5, atol=2e-6)
+    result[0].backward()
+    expected_loss.backward()
+    _assert_parameter_gradients(actual, reference)
+
+
+def test_cpu_forward_enforces_block_isolation():
+    model = make_model()
+    inputs = make_inputs()
+    inputs["injected_anchors"] = torch.tensor([[2, 7]])
+    _, base_hidden = run_and_capture(model, inputs)
+    changed = {key: value.clone() if torch.is_tensor(value) else value
+               for key, value in inputs.items()}
+    # Block 0 (anchor 2) sees neither position 7 nor context positions 4..5.
+    changed["input_ids"][0, 7] = (changed["input_ids"][0, 7] + 1) % 32
+    changed["hidden_states_list"][0, 4:6] += 5.0
+    _, moved_hidden = run_and_capture(model, changed)
+    base_blocks = base_hidden.reshape(1, 2, 5, -1)
+    moved_blocks = moved_hidden.reshape(1, 2, 5, -1)
+    torch.testing.assert_close(base_blocks[:, 0], moved_blocks[:, 0], rtol=0, atol=0)
+    assert not torch.equal(base_blocks[:, 1], moved_blocks[:, 1])
+
+
+def test_non_causal_cpu_fallback_remains_bidirectional():
+    from aspec.models.dflash import DFlashModel
+    from aspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
+
+    config = DFlashConfig(
+        hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=8, vocab_size=32,
+        num_target_layers=1, target_hidden_size=16, target_num_hidden_layers=4,
+        target_layer_ids=[1], mask_token_id=31, max_position_embeddings=128,
+    )
+    draft = DFlashDraftModel(config)
+    draft.embed_tokens.requires_grad_(False)
+    model = DFlashModel(draft, block_size=5, num_anchors=2, attention_backend="sdpa")
+    inputs = make_inputs()
+    inputs["injected_anchors"] = torch.tensor([[2, 7]])
+    _, base_hidden = run_and_capture(model, inputs)
+    changed = {key: value.clone() if torch.is_tensor(value) else value
+               for key, value in inputs.items()}
+    changed["hidden_states_list"][0, 10:] += 5.0
+    _, moved_hidden = run_and_capture(model, changed)
+    assert not torch.equal(base_hidden.reshape(1, 2, 5, -1)[:, 0],
+                           moved_hidden.reshape(1, 2, 5, -1)[:, 0])
+
+
 def test_loss_mask_excludes_unsupervised_labels():
     model = make_model()
     inputs = make_inputs()
@@ -305,7 +361,8 @@ def test_changing_a_later_block_does_not_change_an_earlier_block_loss():
     _, base_per_block = reference_kl(model, base_hidden, inputs)
     changed = {key: value.clone() if torch.is_tensor(value) else value
                for key, value in inputs.items()}
-    # Mutate labels and teacher states only after the first block's suffix.
+    # Change block 1's anchor token and later teacher states only.
+    changed["input_ids"][0, 7] = (changed["input_ids"][0, 7] + 1) % 32
     changed["input_ids"][0, 8:] = (changed["input_ids"][0, 8:] + 1) % 32
     changed["last_hidden_states"][0, 8:] = torch.randn_like(
         changed["last_hidden_states"][0, 8:]

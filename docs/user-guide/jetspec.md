@@ -30,6 +30,11 @@ it, and adds the two pieces that distinguish JetSpec:
 The DFlash2 selector, MoE Draft FFNs, sliding-window Draft layers, native-MTP
 conditioning and packed/CP execution are outside this core.
 
+FlexAttention is used on CUDA. On the CPU SDPA fallback, the same block-causal
+visibility is materialized explicitly so the isolation contract is exercised by
+the default tests. Draft configurations that are not causal keep the previous
+unmasked fallback behavior.
+
 ## Prediction and supervision contract
 
 A block is anchored at an original sequence position `a`. Position `0` keeps the
