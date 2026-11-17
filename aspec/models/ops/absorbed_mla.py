@@ -125,7 +125,11 @@ def absorbed_mla_attention(
         raise ValueError("absorbed MLA requires floating-point tensors")
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
-    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
+    if (
+        isinstance(softmax_scale, bool)
+        or not math.isfinite(softmax_scale)
+        or softmax_scale <= 0
+    ):
         raise ValueError("softmax_scale must be positive and finite")
 
     q_latent = torch.einsum("bshn,hnk->bshk", q_nope, w_uk)
@@ -136,11 +140,16 @@ def absorbed_mla_attention(
         if attn_mask.dtype != torch.bool:
             raise ValueError("attn_mask must be boolean")
         try:
-            scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
+            mask = attn_mask.expand(scores.shape)
         except RuntimeError as exc:
             raise ValueError(
                 "attn_mask must broadcast against [B, H, S, T]"
             ) from exc
+        if not mask.any(dim=-1).all():
+            raise ValueError(
+                "attn_mask must leave at least one visible key per query"
+            )
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
     probs = torch.softmax(scores.float(), dim=-1).to(dtype)
     out_latent = torch.einsum("bhst,btk->bshk", probs, compressed_kv)
     output = torch.einsum("bshk,hvk->bshv", out_latent, w_uv)

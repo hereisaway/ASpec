@@ -78,9 +78,12 @@ def project_q_and_latent(attention, draft_hidden, context_hidden,
                          draft_position_ids, context_position_ids):
     """Reproduce the materialized MLA boundary before attention."""
     batch, draft_len, _ = draft_hidden.shape
-    query = attention.q_b_proj(
-        attention.q_a_layernorm(attention.q_a_proj(draft_hidden))
-    )
+    if attention.q_lora_rank is not None:
+        query = attention.q_b_proj(
+            attention.q_a_layernorm(attention.q_a_proj(draft_hidden))
+        )
+    else:
+        query = attention.q_proj(draft_hidden)
     query = query.view(batch, draft_len, attention.num_heads, attention.qk_head_dim)
     # The retained path transposes to [B, H, S, D] before RoPE.
     query = query.transpose(1, 2)
@@ -165,6 +168,14 @@ def test_dense_mask_excludes_hidden_keys():
     torch.testing.assert_close(moved, actual, rtol=0, atol=0)
 
 
+def test_fully_masked_rows_fail_closed():
+    tensors = make_tensors()
+    mask = torch.ones(1, 2, 4, 7, dtype=torch.bool)
+    mask[:, :, :2] = False
+    with pytest.raises(ValueError, match="visible key"):
+        absorbed_mla_attention(**tensors, attn_mask=mask)
+
+
 def test_mask_broadcasts_over_batch_and_heads():
     tensors = make_tensors(batch=2)
     mask = torch.tril(torch.ones(4, 7, dtype=torch.bool))
@@ -201,6 +212,7 @@ def test_split_rejects_wrong_weight_shape():
     (lambda t: t.update(attn_mask=torch.ones(1, 3, 4, 7, dtype=torch.bool)), "broadcast"),
     (lambda t: t.update(softmax_scale=0.0), "softmax_scale"),
     (lambda t: t.update(softmax_scale=float("nan")), "softmax_scale"),
+    (lambda t: t.update(softmax_scale=True), "softmax_scale"),
 ])
 def test_invalid_inputs_fail_closed(mutation, match):
     tensors = dict(make_tensors(), softmax_scale=None, attn_mask=None)
@@ -211,9 +223,12 @@ def test_invalid_inputs_fail_closed(mutation, match):
         absorbed_mla_attention(**tensors)
 
 
-def test_matches_the_retained_materialized_dspark_attention():
+@pytest.mark.parametrize("q_lora_rank", [8, None])
+def test_matches_the_retained_materialized_dspark_attention(q_lora_rank):
     torch.manual_seed(11)
-    attention = K3DSparkMLAAttention(make_attention_config())
+    attention = K3DSparkMLAAttention(
+        make_attention_config(q_lora_rank=q_lora_rank)
+    )
     batch, query, context = 1, 3, 6
     draft_hidden = torch.randn(batch, query, 16)
     context_hidden = torch.randn(batch, context, 16)
