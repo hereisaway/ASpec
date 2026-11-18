@@ -17,6 +17,7 @@ from torch.nn import functional as F
 from aspec.models.dflash import _create_dflash_mask_mod
 from aspec.models.draft.jetspec import JetSpecConfig, JetSpecDraftModel
 from aspec.models.jetspec import JetSpecModel
+from aspec.models.ops.direct_cp import DirectCPMetadata
 
 
 def make_config(**overrides):
@@ -302,6 +303,44 @@ def test_direct_draft_rejects_layer_without_effective_direct_cp():
         )
 
 
+def _direct_cp_metadata(*, causal):
+    return DirectCPMetadata(
+        anchor_positions=torch.tensor([[1, 3]]),
+        block_keep_mask=torch.ones(1, 2, dtype=torch.bool),
+        context_position_ids=torch.zeros(1, 4, dtype=torch.long),
+        block_size=5,
+        cp_rank=0,
+        cp_size=1,
+        group=None,
+        draft_is_causal=causal,
+    )
+
+
+def test_direct_draft_rejects_noncausal_direct_cp_metadata():
+    draft = JetSpecDraftModel(make_config())
+    with pytest.raises(ValueError, match="causal Direct-CP"):
+        draft.forward(
+            draft_input_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_feature=torch.zeros(1, 12, 16),
+            draft_position_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_position_ids=torch.zeros(1, 12, dtype=torch.long),
+            direct_cp_metadata=_direct_cp_metadata(causal=False),
+        )
+
+    two_layer = JetSpecDraftModel(make_config(num_hidden_layers=2))
+    with pytest.raises(ValueError, match="causal Direct-CP"):
+        two_layer.forward(
+            draft_input_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_feature=torch.zeros(1, 12, 16),
+            draft_position_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_position_ids=torch.zeros(1, 12, dtype=torch.long),
+            direct_cp_metadata=[
+                _direct_cp_metadata(causal=True),
+                _direct_cp_metadata(causal=False),
+            ],
+        )
+
+
 def test_direct_draft_forward_requires_explicit_causal_visibility():
     draft = JetSpecDraftModel(make_config())
     with pytest.raises(ValueError, match="causal visibility"):
@@ -417,7 +456,7 @@ def test_target_features_are_detached_and_required():
         model(**missing)
 
 
-@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf"), True, 1e-40])
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf"), True, 1e-40, 1e200])
 def test_invalid_temperature_fails_closed(temperature):
     draft = JetSpecDraftModel(make_config())
     with pytest.raises(ValueError, match="temperature"):

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from aspec.models.dflash import DFlashModel
 
 _MIN_TEMPERATURE = 1e-6
+_MAX_TEMPERATURE = math.sqrt(torch.finfo(torch.float32).max)
 
 
 class _ChunkedForwardKL(torch.autograd.Function):
@@ -100,10 +101,11 @@ class JetSpecModel(DFlashModel):
         if (isinstance(distillation_temperature, bool)
                 or not isinstance(distillation_temperature, (int, float))
                 or not math.isfinite(temperature)
-                or temperature < _MIN_TEMPERATURE):
+                or not _MIN_TEMPERATURE <= temperature <= _MAX_TEMPERATURE):
             raise ValueError(
-                "JetSpec distillation_temperature must be finite and at least "
-                f"{_MIN_TEMPERATURE:g}"
+                "JetSpec distillation_temperature must be finite and in "
+                f"[{_MIN_TEMPERATURE:g}, {_MAX_TEMPERATURE:g}] so its squared "
+                "FP32 scale is finite"
             )
         self.distillation_temperature = temperature
         if (isinstance(kl_chunk_rows, bool) or not isinstance(kl_chunk_rows, int)

@@ -68,6 +68,13 @@ class JetSpecDraftModel(DFlashDraftModel):
                 raise ValueError(
                     "JetSpec requires an effective causal mask for every Draft layer"
                 )
+        metadata_entries = (
+            direct_cp_metadata
+            if isinstance(direct_cp_metadata, (list, tuple))
+            else ([direct_cp_metadata] if direct_cp_metadata is not None else [])
+        )
+        if any(getattr(entry, "draft_is_causal", False) is not True for entry in metadata_entries):
+            raise ValueError("JetSpec requires causal Direct-CP metadata")
         return super().forward(
             draft_input_ids=draft_input_ids,
             context_feature=context_feature,

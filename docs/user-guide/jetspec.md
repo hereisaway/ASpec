@@ -60,8 +60,8 @@ under `torch.no_grad()`. The Target hidden states must come from
 
 `JetSpecModel` fails closed when the Draft config is not a causal
 `JetSpecDraftModel`, when CE/L1 alphas are nonzero, when the training block size
-disagrees with the Draft config, or when the temperature is not finite and at
-least `1e-6`. `JetSpecConfig` fixes the architecture
+disagrees with the Draft config, or when the temperature is not finite and inside
+the range where the FP32 `T^2` scale stays finite. `JetSpecConfig` fixes the architecture
 to `JetSpecDraftModel`, forces `is_causal=true`, and rejects non-dense FFNs,
 sliding-window layers and MTP conditioning.
 
