@@ -19,7 +19,7 @@ from aspec.models.dflash import DFlashModel
 class JetSpecModel(DFlashModel):
     """DFlash block head with causal intra-block attention and forward KL."""
 
-    def __init__(self, *args, distillation_temperature=1.0, **kwargs):
+    def __init__(self, *args, distillation_temperature=1.0, kl_chunk_rows=256, **kwargs):
         # Main JetSpec results use uniform per-position weights (gamma = 0).
         kwargs.setdefault("loss_decay_gamma", 0.0)
         super().__init__(*args, **kwargs)
@@ -40,6 +40,10 @@ class JetSpecModel(DFlashModel):
                 or float(distillation_temperature) <= 0):
             raise ValueError("JetSpec distillation_temperature must be positive and finite")
         self.distillation_temperature = float(distillation_temperature)
+        if (isinstance(kl_chunk_rows, bool) or not isinstance(kl_chunk_rows, int)
+                or kl_chunk_rows < 1):
+            raise ValueError("JetSpec kl_chunk_rows must be a positive integer")
+        self.kl_chunk_rows = int(kl_chunk_rows)
         if config is not None and hasattr(config, "block_size"):
             if int(config.block_size) != self.block_size:
                 raise ValueError("JetSpec training block_size must match its Draft config")
@@ -71,6 +75,7 @@ class JetSpecModel(DFlashModel):
         sequence_length,
         input_ids,
         anchor_positions,
+        objective_weight_mask=None,
     ):
         if last_hidden_states is None:
             raise ValueError(
@@ -84,15 +89,36 @@ class JetSpecModel(DFlashModel):
             global_sequence_length=sequence_length,
             packed_context_positions=packed_context_positions,
         )
-        with torch.no_grad():
-            target_logits = F.linear(
-                aligned_hidden.detach(), lm_head_weight.detach()
-            ).float().reshape(-1, logits.size(-1))
-        draft_logits = logits.float().reshape(-1, logits.size(-1))
+        vocabulary = logits.size(-1)
+        draft_logits = logits.reshape(-1, vocabulary)
+        flat_hidden = aligned_hidden.detach().reshape(-1, aligned_hidden.size(-1))
+        if flat_hidden.size(0) != draft_logits.size(0):
+            raise ValueError("JetSpec teacher rows do not match Draft logits")
+        rows = draft_logits.size(0)
+        active = (
+            torch.arange(rows, device=draft_logits.device)
+            if objective_weight_mask is None
+            else (objective_weight_mask.reshape(-1) > 0).nonzero(as_tuple=False).flatten()
+        )
+        # Keep a differentiable path for an entirely masked window.
+        if active.numel() == 0:
+            active = torch.zeros(1, dtype=torch.long, device=draft_logits.device)
+
         temperature = self.distillation_temperature
-        log_q = F.log_softmax(draft_logits / temperature, dim=-1)
-        p = F.softmax(target_logits / temperature, dim=-1)
-        kl = F.kl_div(log_q, p, reduction="none").sum(-1)
-        # The paper's Eq. 6 keeps the standard T^2 gradient scale.
-        kl = kl * (temperature * temperature)
+        kl = torch.zeros(rows, dtype=torch.float32, device=draft_logits.device)
+        # Bound the full-vocabulary projection and FP32 KL intermediates: each
+        # chunk only materializes chunk_rows x vocab tensors.
+        for start in range(0, active.numel(), self.kl_chunk_rows):
+            row_ids = active[start : start + self.kl_chunk_rows]
+            hidden = flat_hidden.index_select(0, row_ids)
+            with torch.no_grad():
+                target_logits = F.linear(hidden, lm_head_weight.detach()).float()
+            log_q = F.log_softmax(
+                draft_logits.index_select(0, row_ids).float() / temperature, dim=-1
+            )
+            log_p = F.log_softmax(target_logits / temperature, dim=-1)
+            chunk = F.kl_div(log_q, log_p, reduction="none", log_target=True).sum(-1)
+            # The paper's Eq. 6 keeps the standard T^2 gradient scale.
+            kl = kl.index_put((row_ids,), chunk * (temperature * temperature))
         return kl, kl, logits
+

@@ -31,7 +31,7 @@ def make_config(**overrides):
     return JetSpecConfig(**values)
 
 
-def make_model(*, temperature=1.0, loss_decay_gamma=0.0, seed=17, **config_overrides):
+def make_model(*, temperature=1.0, loss_decay_gamma=0.0, kl_chunk_rows=256, seed=17, **config_overrides):
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
         draft = JetSpecDraftModel(make_config(**config_overrides))
@@ -40,7 +40,7 @@ def make_model(*, temperature=1.0, loss_decay_gamma=0.0, seed=17, **config_overr
         draft, block_size=draft.config.block_size, num_anchors=2,
         attention_backend="sdpa", ce_loss_alpha=0.0, l1_loss_alpha=0.0,
         loss_decay_gamma=loss_decay_gamma,
-        distillation_temperature=temperature,
+        distillation_temperature=temperature, kl_chunk_rows=kl_chunk_rows,
     )
 
 
@@ -219,6 +219,67 @@ def test_two_row_forward_kl_matches_reference_and_backward():
     _assert_parameter_gradients(actual, reference)
 
 
+def test_chunked_kl_matches_dense_objective_and_gradients():
+    chunked = make_model(temperature=1.5, kl_chunk_rows=3)
+    dense = make_model(temperature=1.5, kl_chunk_rows=256)
+    inputs, dense_inputs = make_inputs(batch=2), make_inputs(batch=2)
+    result, _ = run_and_capture(chunked, inputs)
+    expected, dense_captured = run_and_capture(dense, dense_inputs)
+    reference_loss, _ = reference_kl(dense, dense_captured, dense_inputs)
+    torch.testing.assert_close(result[0], expected[0], rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(result[0], reference_loss, rtol=2e-5, atol=2e-6)
+    result[0].backward()
+    expected[0].backward()
+    _assert_parameter_gradients(chunked, dense)
+
+
+def test_target_projection_uses_bounded_token_chunks(monkeypatch):
+    model = make_model(kl_chunk_rows=3)
+    inputs = make_inputs(batch=2)
+    rows_per_projection = []
+    original_linear = F.linear
+
+    def recording_linear(input, weight, bias=None):
+        if not torch.is_grad_enabled():
+            rows_per_projection.append(input.shape[0])
+        return original_linear(input, weight, bias)
+
+    monkeypatch.setattr(F, "linear", recording_linear)
+    result, _ = run_and_capture(model, inputs)
+    result[0].backward()
+    assert rows_per_projection
+    assert max(rows_per_projection) <= 3
+
+
+def test_cpu_causal_path_rejects_packed_documents():
+    model = make_model()
+    inputs = make_inputs()
+    inputs["injected_anchors"] = torch.tensor([[1, 2]])
+    inputs["ctx_doc_ids"] = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1]])
+    with pytest.raises(ValueError, match="packed ctx_doc_ids"):
+        model(**inputs)
+
+
+def test_direct_draft_forward_requires_explicit_causal_visibility():
+    draft = JetSpecDraftModel(make_config())
+    with pytest.raises(ValueError, match="causal visibility"):
+        draft.forward(
+            draft_input_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_feature=torch.zeros(1, 12, 16),
+            draft_position_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_position_ids=torch.zeros(1, 12, dtype=torch.long),
+        )
+
+
+def test_draft_forward_keeps_noise_embedding_positional_slot():
+    import inspect
+
+    from aspec.models.draft.dflash import DFlashDraftModel
+
+    parameters = list(inspect.signature(DFlashDraftModel.forward).parameters)
+    assert parameters.index("noise_embedding") < parameters.index("draft_attention_mask")
+
+
 def test_cpu_forward_enforces_block_isolation():
     model = make_model()
     inputs = make_inputs()
@@ -309,6 +370,15 @@ def test_invalid_temperature_fails_closed(temperature):
         JetSpecModel(draft, block_size=5, num_anchors=2, attention_backend="sdpa",
                      ce_loss_alpha=0.0, l1_loss_alpha=0.0,
                      distillation_temperature=temperature)
+
+
+@pytest.mark.parametrize("kl_chunk_rows", [0, -1, True, 1.5])
+def test_invalid_kl_chunk_rows_fail_closed(kl_chunk_rows):
+    draft = JetSpecDraftModel(make_config())
+    with pytest.raises(ValueError, match="kl_chunk_rows"):
+        JetSpecModel(draft, block_size=5, num_anchors=2, attention_backend="sdpa",
+                     ce_loss_alpha=0.0, l1_loss_alpha=0.0,
+                     kl_chunk_rows=kl_chunk_rows)
 
 
 def test_non_kl_components_fail_closed():

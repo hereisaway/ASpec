@@ -64,6 +64,17 @@ the temperature is not positive and finite. `JetSpecConfig` fixes the architectu
 to `JetSpecDraftModel`, forces `is_causal=true`, and rejects non-dense FFNs,
 sliding-window layers and MTP conditioning.
 
+The full-vocabulary Target projection and FP32 KL intermediates are processed in
+bounded token chunks (`kl_chunk_rows`, default 256). Only rows with positive
+objective weight are projected, so an entire masked window keeps a differentiable
+zero rather than materializing the full `[tokens, vocabulary]` tensors at once.
+
+The training wrapper always supplies explicit visibility. A direct
+`JetSpecDraftModel.forward` call must pass `block_mask`, `draft_attention_mask` or
+`direct_cp_metadata`; otherwise it fails closed instead of silently running
+bidirectional SDPA. The CPU dense-mask path also rejects packed `ctx_doc_ids`,
+because the dense helper cannot preserve document isolation.
+
 ## Minimal numerical use
 
 Inside the [isolated environment](installation.md):
@@ -109,8 +120,9 @@ denominator. Per-position loss now reports KL rather than CE.
 - This core does not provide a recipe, trainer selection, exact resume, tree
   construction, export, strict reloading or a serving consumer. Those remain for
   follow-up work under the issue's expected outcomes.
-- CPU checks cover the configuration contract, causal mask construction, forward
-  KL and gradients against independent equations, anchor/loss-mask exclusion,
-  empty supervision and document-local label alignment. They do not certify GPU
-  attention execution, convergence, acceptance length or serving performance.
+- CPU checks cover the configuration contract, causal mask construction, bounded
+  forward KL and gradients against independent equations, explicit-mask and packed
+  fail-closed paths, anchor/loss-mask exclusion, empty supervision and
+  document-local label alignment. They do not certify GPU attention execution,
+  convergence, acceptance length or serving performance.
 - The default tests are in `tests/cpu/test_jetspec.py`.

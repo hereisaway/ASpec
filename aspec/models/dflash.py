@@ -499,6 +499,7 @@ class DFlashModel(nn.Module):
         sequence_length: int,
         input_ids: torch.Tensor,
         anchor_positions: torch.Tensor,
+        objective_weight_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per-token objective and the logits used for reporting.
 
@@ -875,6 +876,10 @@ class DFlashModel(nn.Module):
                 if causal and set(options) - {"is_causal"}:
                     raise ValueError(
                         "CPU causal Draft attention does not implement these mask options"
+                    )
+                if causal and ctx_doc_ids is not None:
+                    raise ValueError(
+                        "CPU causal Draft attention does not support packed ctx_doc_ids"
                     )
                 if causal not in dense_cache:
                     dense_cache[causal] = (
@@ -1262,6 +1267,7 @@ class DFlashModel(nn.Module):
             sequence_length=seq_len,
             input_ids=input_ids,
             anchor_positions=anchor_positions,
+            objective_weight_mask=weight_mask,
         )
         loss_per_token_by_position = loss_per_token_by_position.view(
             bsz, n_blocks, self.block_size

@@ -95,6 +95,7 @@ class DominoModel(DFlashModel):
         sequence_length,
         input_ids,
         anchor_positions,
+        objective_weight_mask=None,
     ):
         base_logits = logits
         corrected_logits = self.draft_model.correct_logits(
