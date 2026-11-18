@@ -441,6 +441,7 @@ class DFlashAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        draft_attention_mask=None,
         direct_cp_metadata=None,
         csa_metadata=None,
         csa_prepared=None,
@@ -458,6 +459,8 @@ class DFlashAttention(nn.Module):
             draft_position_ids: [B, draft_len] — position IDs for draft tokens
             context_position_ids: [B, ctx_len] — position IDs for context tokens
             block_mask: FlexAttention BlockMask for block-causal attention
+            draft_attention_mask: Boolean [B, draft_len, ctx_len+draft_len] mask
+                for the non-FlexAttention fallback (for example CPU tests).
         """
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -959,10 +962,18 @@ class DFlashAttention(nn.Module):
                 enable_gqa=True,
             )
         else:
-            # Fallback: bidirectional attention (no mask) — expand KV for SDPA
+            # Fallback: SDPA with an optional materialized block mask (CPU).
             k = _repeat_kv(k, self.num_kv_groups)
             v = _repeat_kv(v, self.num_kv_groups)
-            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
+            if draft_attention_mask is None:
+                attn_output = F.scaled_dot_product_attention(
+                    q, k, v, is_causal=False, dropout_p=0.0,
+                )
+            else:
+                attn_output = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=draft_attention_mask.unsqueeze(1),
+                    is_causal=False, dropout_p=0.0,
+                )
 
         if not use_cudnn_flex:
             attn_output = attn_output.transpose(1, 2).contiguous()
@@ -1016,6 +1027,7 @@ class DFlashDecoderLayer(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        draft_attention_mask=None,
         direct_cp_metadata=None,
         csa_metadata=None,
         csa_prepared=None,
@@ -1042,6 +1054,8 @@ class DFlashDecoderLayer(nn.Module):
             }
         if hasattr(self.self_attn, "dsa_layer"):
             qsa_kwargs.update(dsa_metadata=dsa_metadata, dsa_layout=dsa_layout)
+        if draft_attention_mask is not None:
+            qsa_kwargs["draft_attention_mask"] = draft_attention_mask
         draft_hidden = self.self_attn(
             draft_hidden=draft_hidden,
             context_hidden=context_hidden,
@@ -1106,6 +1120,8 @@ class DFlashDraftModel(PreTrainedModel):
     config_class = DFlashConfig
     supports_gradient_checkpointing = True
     decoder_layer_class = DFlashDecoderLayer
+    # CPU dense causal masks are built only for Drafts that consume them.
+    supports_draft_attention_mask = True
     # See Eagle3DraftModel.all_tied_weights_keys.
     all_tied_weights_keys = {}
 
@@ -1306,6 +1322,7 @@ class DFlashDraftModel(PreTrainedModel):
         context_position_ids: torch.Tensor,
         block_mask=None,
         noise_embedding: Optional[torch.Tensor] = None,
+        draft_attention_mask=None,
         direct_cp_metadata=None,
         csa_metadata=None,
         qsa_metadata=None,
@@ -1397,6 +1414,9 @@ class DFlashDraftModel(PreTrainedModel):
             layer_block_mask = block_mask
             if isinstance(block_mask, (list, tuple)):
                 layer_block_mask = block_mask[layer_id]
+            layer_draft_mask = draft_attention_mask
+            if isinstance(draft_attention_mask, (list, tuple)):
+                layer_draft_mask = draft_attention_mask[layer_id]
             layer_metadata = (
                 direct_cp_metadata[layer_id]
                 if isinstance(direct_cp_metadata, (list, tuple)) else direct_cp_metadata
@@ -1429,6 +1449,7 @@ class DFlashDraftModel(PreTrainedModel):
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
                 block_mask=layer_block_mask,
+                draft_attention_mask=layer_draft_mask,
                 direct_cp_metadata=layer_metadata,
                 csa_metadata=csa_metadata,
                 csa_prepared=csa_prepared,

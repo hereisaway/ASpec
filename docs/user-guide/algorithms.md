@@ -112,6 +112,14 @@ anchor-shared window. FA4 preserves
 convolution, selector, document boundaries and CP ownership. Functional results do not establish
 official-recipe reproduction or long-term quality.
 
+## JetSpec core prerequisite
+
+The [JetSpec model/loss API](jetspec.md) combines the retained DFlash block head
+with causal intra-block attention and a temperature-scaled forward-KL objective
+against frozen Target features. `JetSpecConfig` forces that causal contract and
+rejects incompatible structures. Public training, tree construction, recovery,
+export and consumer validation remain pending.
+
 ## Native MTP conditioning for DSpark/DFlash
 
 `configs/recipes/qwen3_5_9b_dmtp.yaml` uses the native Qwen3.5 predictor as a frozen

@@ -131,6 +131,51 @@ def _create_dflash_mask_mod(
     return dflash_mask_mod
 
 
+def _create_dflash_dense_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    ctx_len: int,
+    block_size: int,
+    is_causal: bool,
+) -> torch.Tensor:
+    """Materialize the block mask for backends without FlexAttention (CPU).
+
+    Returns a boolean ``[B, Q, KV]`` mask where True means visible. Invalid
+    blocks see only their own draft query row so softmax stays finite; their
+    objective weights are already zero.
+    """
+    num_anchors = anchor_positions.shape[1]
+    draft_len = num_anchors * block_size
+    kv_len = ctx_len + draft_len
+    device = anchor_positions.device
+    q_index = torch.arange(draft_len, device=device)
+    kv_index = torch.arange(kv_len, device=device)
+    q_block = q_index // block_size
+    anchor = anchor_positions.index_select(1, q_block)
+
+    is_context = kv_index < ctx_len
+    mask_context = is_context.unsqueeze(0).unsqueeze(0) & (
+        kv_index.unsqueeze(0).unsqueeze(0) < anchor.unsqueeze(-1)
+    )
+    is_draft = kv_index >= ctx_len
+    kv_block = (kv_index - ctx_len) // block_size
+    mask_draft = is_draft.unsqueeze(0).unsqueeze(0) & (
+        q_block.unsqueeze(0).unsqueeze(-1) == kv_block.unsqueeze(0).unsqueeze(0)
+    )
+    if is_causal:
+        q_offset = q_index % block_size
+        kv_offset = (kv_index - ctx_len) % block_size
+        mask_draft = mask_draft & (
+            kv_offset.unsqueeze(0).unsqueeze(0) <= q_offset.unsqueeze(0).unsqueeze(-1)
+        )
+    valid = block_keep_mask.index_select(1, q_block)
+    mask = (mask_context | mask_draft) & valid.unsqueeze(-1)
+
+    diagonal = torch.zeros(draft_len, kv_len, dtype=torch.bool, device=device)
+    diagonal[torch.arange(draft_len, device=device), ctx_len + q_index] = True
+    return mask | (~valid.unsqueeze(-1) & diagonal.unsqueeze(0))
+
+
 class DFlashModel(nn.Module):
     """DFlash training wrapper.
 
@@ -454,6 +499,7 @@ class DFlashModel(nn.Module):
         sequence_length: int,
         input_ids: torch.Tensor,
         anchor_positions: torch.Tensor,
+        objective_weight_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per-token objective and the logits used for reporting.
 
@@ -820,6 +866,40 @@ class DFlashModel(nn.Module):
                 else block_masks
             )
 
+        dense_attention_masks = None
+        if (
+            block_mask is None
+            and direct_cp_metadata is None
+            and device.type != "cuda"
+            and getattr(self.draft_model, "supports_draft_attention_mask", False)
+        ):
+            dense_cache = {}
+            dense_masks = []
+            for layer_id in range(self.draft_model.num_layers):
+                options = self._block_mask_options_for_layer(layer_id)
+                causal = bool(options.get("is_causal", False))
+                if causal and set(options) - {"is_causal"}:
+                    raise ValueError(
+                        "CPU causal Draft attention does not implement these mask options"
+                    )
+                if causal and ctx_doc_ids is not None:
+                    raise ValueError(
+                        "CPU causal Draft attention does not support packed ctx_doc_ids"
+                    )
+                if causal not in dense_cache:
+                    dense_cache[causal] = (
+                        _create_dflash_dense_mask(
+                            anchor_positions, block_keep_mask, seq_len,
+                            self.block_size, is_causal=True,
+                        )
+                        if causal else None
+                    )
+                dense_masks.append(dense_cache[causal])
+            if True in dense_cache:
+                dense_attention_masks = (
+                    dense_masks[0] if len(dense_cache) == 1 else dense_masks
+                )
+
         if direct_cp_metadata is not None:
             from dataclasses import replace
 
@@ -946,6 +1026,7 @@ class DFlashModel(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            draft_attention_mask=dense_attention_masks,
             noise_embedding=noise_embedding,
             direct_cp_metadata=direct_cp_metadata,
             csa_metadata=csa_metadata,
@@ -1191,6 +1272,7 @@ class DFlashModel(nn.Module):
             sequence_length=seq_len,
             input_ids=input_ids,
             anchor_positions=anchor_positions,
+            objective_weight_mask=weight_mask,
         )
         loss_per_token_by_position = loss_per_token_by_position.view(
             bsz, n_blocks, self.block_size
