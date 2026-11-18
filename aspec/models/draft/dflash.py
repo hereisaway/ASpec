@@ -1115,6 +1115,8 @@ class DFlashDraftModel(PreTrainedModel):
     config_class = DFlashConfig
     supports_gradient_checkpointing = True
     decoder_layer_class = DFlashDecoderLayer
+    # CPU dense causal masks are built only for Drafts that consume them.
+    supports_draft_attention_mask = True
     # See Eagle3DraftModel.all_tied_weights_keys.
     all_tied_weights_keys = {}
 

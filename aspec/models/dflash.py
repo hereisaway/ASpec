@@ -867,7 +867,12 @@ class DFlashModel(nn.Module):
             )
 
         dense_attention_masks = None
-        if block_mask is None and direct_cp_metadata is None and device.type != "cuda":
+        if (
+            block_mask is None
+            and direct_cp_metadata is None
+            and device.type != "cuda"
+            and getattr(self.draft_model, "supports_draft_attention_mask", False)
+        ):
             dense_cache = {}
             dense_masks = []
             for layer_id in range(self.draft_model.num_layers):

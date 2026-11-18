@@ -468,6 +468,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
 class DFlash2DraftModel(DFlashDraftModel):
     config_class = DFlash2Config
     decoder_layer_class = DFlash2DecoderLayer
+    supports_draft_attention_mask = False
 
     def __init__(self, config: DFlash2Config):
         super().__init__(config)

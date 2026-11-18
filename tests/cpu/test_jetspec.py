@@ -271,6 +271,18 @@ def test_direct_draft_forward_requires_explicit_causal_visibility():
         )
 
 
+def test_direct_draft_rejects_a_layer_without_an_effective_mask():
+    draft = JetSpecDraftModel(make_config(num_hidden_layers=2))
+    with pytest.raises(ValueError, match="every Draft layer"):
+        draft.forward(
+            draft_input_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_feature=torch.zeros(1, 12, 16),
+            draft_position_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_position_ids=torch.zeros(1, 12, dtype=torch.long),
+            draft_attention_mask=[torch.ones(1, 10, 22, dtype=torch.bool), None],
+        )
+
+
 def test_draft_forward_keeps_noise_embedding_positional_slot():
     import inspect
 
@@ -363,7 +375,7 @@ def test_target_features_are_detached_and_required():
         model(**missing)
 
 
-@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf"), True])
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf"), True, 1e-40])
 def test_invalid_temperature_fails_closed(temperature):
     draft = JetSpecDraftModel(make_config())
     with pytest.raises(ValueError, match="temperature"):
@@ -409,6 +421,22 @@ def test_model_requires_a_causal_draft_config():
                      ce_loss_alpha=0.0, l1_loss_alpha=0.0)
 
 
+def test_model_rejects_a_non_jetspec_causal_config():
+    from aspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
+
+    config = DFlashConfig(
+        hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=8, vocab_size=32,
+        num_target_layers=1, target_hidden_size=16, target_num_hidden_layers=4,
+        target_layer_ids=[1], mask_token_id=31, max_position_embeddings=128,
+        is_causal=True,
+    )
+    draft = DFlashDraftModel(config)
+    with pytest.raises(ValueError, match="JetSpecDraftModel"):
+        JetSpecModel(draft, block_size=5, num_anchors=2, attention_backend="sdpa",
+                     ce_loss_alpha=0.0, l1_loss_alpha=0.0)
+
+
 def test_short_sequences_keep_loss_finite():
     model = make_model(block_size=5)
     inputs = make_inputs(length=6)
@@ -425,6 +453,15 @@ def test_short_sequences_keep_loss_finite():
 
 def test_changing_a_later_block_does_not_change_an_earlier_block_loss():
     model = make_model()
+    captured = []
+    original_training_loss = model._training_loss
+
+    def recording_training_loss(*args, **kwargs):
+        result = original_training_loss(*args, **kwargs)
+        captured.append(result[0].detach().clone())
+        return result
+
+    model._training_loss = recording_training_loss
     inputs = make_inputs()
     inputs["injected_anchors"] = torch.tensor([[2, 7]])
     _, base_hidden = run_and_capture(model, inputs)
@@ -442,3 +479,8 @@ def test_changing_a_later_block_does_not_change_an_earlier_block_loss():
     torch.testing.assert_close(base_per_block[0, 0], moved_per_block[0, 0],
                                rtol=0, atol=0)
     assert not torch.equal(base_per_block[0, 1], moved_per_block[0, 1])
+    base_production = captured[0].reshape(1, 2, model.block_size)
+    moved_production = captured[1].reshape(1, 2, model.block_size)
+    torch.testing.assert_close(base_production[0, 0], moved_production[0, 0],
+                               rtol=0, atol=0)
+    assert not torch.equal(base_production[0, 1], moved_production[0, 1])

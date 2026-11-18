@@ -61,6 +61,13 @@ class JetSpecDraftModel(DFlashDraftModel):
                 "JetSpecDraftModel.forward requires block_mask, draft_attention_mask "
                 "or direct_cp_metadata so causal visibility is explicit"
             )
+        for masks in (block_mask, draft_attention_mask):
+            if isinstance(masks, (list, tuple)) and (
+                len(masks) != self.num_layers or any(mask is None for mask in masks)
+            ):
+                raise ValueError(
+                    "JetSpec requires an effective causal mask for every Draft layer"
+                )
         return super().forward(
             draft_input_ids=draft_input_ids,
             context_feature=context_feature,

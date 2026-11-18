@@ -15,6 +15,57 @@ import torch.nn.functional as F
 
 from aspec.models.dflash import DFlashModel
 
+_MIN_TEMPERATURE = 1e-6
+
+
+class _ChunkedForwardKL(torch.autograd.Function):
+    """Forward KL whose full-vocabulary intermediates are recomputed in backward.
+
+    Saving ``log_q``/``log_p`` per chunk would keep O(tokens * vocabulary) FP32
+    state alive until backward. The custom backward instead retains the existing
+    Draft logits and teacher hidden states, then recomputes one chunk at a time.
+    """
+
+    @staticmethod
+    def forward(ctx, draft_logits, hidden, lm_head_weight, temperature, chunk_rows, active):
+        rows = draft_logits.shape[0]
+        kl = torch.zeros(rows, dtype=torch.float32, device=draft_logits.device)
+        for start in range(0, active.numel(), chunk_rows):
+            row_ids = active[start : start + chunk_rows]
+            target_logits = F.linear(
+                hidden.index_select(0, row_ids), lm_head_weight
+            ).float()
+            log_p = F.log_softmax(target_logits / temperature, dim=-1)
+            log_q = F.log_softmax(
+                draft_logits.index_select(0, row_ids).float() / temperature, dim=-1
+            )
+            chunk = F.kl_div(log_q, log_p, reduction="none", log_target=True).sum(-1)
+            kl.index_put_((row_ids,), chunk * (temperature * temperature))
+        ctx.save_for_backward(draft_logits, hidden, lm_head_weight, active)
+        ctx.temperature = temperature
+        ctx.chunk_rows = chunk_rows
+        return kl
+
+    @staticmethod
+    def backward(ctx, grad_kl):
+        draft_logits, hidden, lm_head_weight, active = ctx.saved_tensors
+        temperature = ctx.temperature
+        gradient = torch.zeros_like(draft_logits)
+        for start in range(0, active.numel(), ctx.chunk_rows):
+            row_ids = active[start : start + ctx.chunk_rows]
+            target_logits = F.linear(
+                hidden.index_select(0, row_ids), lm_head_weight
+            ).float()
+            p = F.softmax(target_logits / temperature, dim=-1)
+            q = F.softmax(
+                draft_logits.index_select(0, row_ids).float() / temperature, dim=-1
+            )
+            scale = grad_kl.index_select(0, row_ids).float().unsqueeze(-1)
+            gradient.index_put_(
+                (row_ids,), ((q - p) * temperature * scale).to(gradient.dtype)
+            )
+        return gradient, None, None, None, None, None
+
 
 class JetSpecModel(DFlashModel):
     """DFlash block head with causal intra-block attention and forward KL."""
@@ -26,6 +77,8 @@ class JetSpecModel(DFlashModel):
         config = getattr(self.draft_model, "config", None)
         if not bool(getattr(config, "is_causal", False)):
             raise ValueError("JetSpec requires Draft config is_causal=true")
+        if getattr(config, "architectures", None) != ["JetSpecDraftModel"]:
+            raise ValueError("JetSpecModel requires a JetSpecDraftModel config")
         if self.mtp_conditioning is not None:
             raise ValueError("JetSpec does not use the native-MTP conditioning contract")
         if self.loss_objective != "decay":
@@ -34,12 +87,16 @@ class JetSpecModel(DFlashModel):
             raise ValueError("JetSpec replaces CE/L1 with forward KL; set both alphas to zero")
         if self.prediction_start != 1:
             raise ValueError("JetSpec supervises the suffix after the anchor position")
+        temperature = float(distillation_temperature)
         if (isinstance(distillation_temperature, bool)
                 or not isinstance(distillation_temperature, (int, float))
-                or not math.isfinite(float(distillation_temperature))
-                or float(distillation_temperature) <= 0):
-            raise ValueError("JetSpec distillation_temperature must be positive and finite")
-        self.distillation_temperature = float(distillation_temperature)
+                or not math.isfinite(temperature)
+                or temperature < _MIN_TEMPERATURE):
+            raise ValueError(
+                "JetSpec distillation_temperature must be finite and at least "
+                f"{_MIN_TEMPERATURE:g}"
+            )
+        self.distillation_temperature = temperature
         if (isinstance(kl_chunk_rows, bool) or not isinstance(kl_chunk_rows, int)
                 or kl_chunk_rows < 1):
             raise ValueError("JetSpec kl_chunk_rows must be a positive integer")
@@ -100,25 +157,15 @@ class JetSpecModel(DFlashModel):
             if objective_weight_mask is None
             else (objective_weight_mask.reshape(-1) > 0).nonzero(as_tuple=False).flatten()
         )
-        # Keep a differentiable path for an entirely masked window.
-        if active.numel() == 0:
-            active = torch.zeros(1, dtype=torch.long, device=draft_logits.device)
-
-        temperature = self.distillation_temperature
-        kl = torch.zeros(rows, dtype=torch.float32, device=draft_logits.device)
-        # Bound the full-vocabulary projection and FP32 KL intermediates: each
-        # chunk only materializes chunk_rows x vocab tensors.
-        for start in range(0, active.numel(), self.kl_chunk_rows):
-            row_ids = active[start : start + self.kl_chunk_rows]
-            hidden = flat_hidden.index_select(0, row_ids)
-            with torch.no_grad():
-                target_logits = F.linear(hidden, lm_head_weight.detach()).float()
-            log_q = F.log_softmax(
-                draft_logits.index_select(0, row_ids).float() / temperature, dim=-1
-            )
-            log_p = F.log_softmax(target_logits / temperature, dim=-1)
-            chunk = F.kl_div(log_q, log_p, reduction="none", log_target=True).sum(-1)
-            # The paper's Eq. 6 keeps the standard T^2 gradient scale.
-            kl = kl.index_put((row_ids,), chunk * (temperature * temperature))
+        # The custom backward recomputes one chunk at a time, so neither the
+        # forward nor the saved state keeps every full-vocabulary chunk alive.
+        kl = _ChunkedForwardKL.apply(
+            draft_logits,
+            flat_hidden,
+            lm_head_weight.detach(),
+            self.distillation_temperature,
+            self.kl_chunk_rows,
+            active,
+        )
         return kl, kl, logits
 

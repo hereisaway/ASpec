@@ -58,16 +58,19 @@ the main paper configuration; both are configurable. Target logits are produced
 under `torch.no_grad()`. The Target hidden states must come from
 `inference.store_last_hidden_states=true`, as for the existing L1 distillation path.
 
-`JetSpecModel` fails closed when the Draft config is not causal, when CE/L1 alphas
-are nonzero, when the training block size disagrees with the Draft config, or when
-the temperature is not positive and finite. `JetSpecConfig` fixes the architecture
+`JetSpecModel` fails closed when the Draft config is not a causal
+`JetSpecDraftModel`, when CE/L1 alphas are nonzero, when the training block size
+disagrees with the Draft config, or when the temperature is not finite and at
+least `1e-6`. `JetSpecConfig` fixes the architecture
 to `JetSpecDraftModel`, forces `is_causal=true`, and rejects non-dense FFNs,
 sliding-window layers and MTP conditioning.
 
 The full-vocabulary Target projection and FP32 KL intermediates are processed in
 bounded token chunks (`kl_chunk_rows`, default 256). Only rows with positive
-objective weight are projected, so an entire masked window keeps a differentiable
-zero rather than materializing the full `[tokens, vocabulary]` tensors at once.
+objective weight are projected, and a custom backward recomputes each chunk
+instead of retaining every chunk's log-probability tensors until backward. An
+entire masked window keeps an exact differentiable zero without projecting a
+teacher row.
 
 The training wrapper always supplies explicit visibility. A direct
 `JetSpecDraftModel.forward` call must pass `block_mask`, `draft_attention_mask` or
@@ -122,7 +125,7 @@ denominator. Per-position loss now reports KL rather than CE.
   follow-up work under the issue's expected outcomes.
 - CPU checks cover the configuration contract, causal mask construction, bounded
   forward KL and gradients against independent equations, explicit-mask and packed
-  fail-closed paths, anchor/loss-mask exclusion, empty supervision and
-  document-local label alignment. They do not certify GPU attention execution,
-  convergence, acceptance length or serving performance.
+  fail-closed paths, anchor/loss-mask exclusion, empty supervision and next-token
+  label/teacher alignment on unpacked inputs. They do not certify GPU attention
+  execution, convergence, acceptance length or serving performance.
 - The default tests are in `tests/cpu/test_jetspec.py`.
