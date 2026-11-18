@@ -251,14 +251,16 @@ def test_trainer_builds_domino_wrapper_and_pins_block_size():
         trainer._build_draft_model(_tiny_config())
 
 
-@pytest.mark.parametrize("missing", ["empty", "lambda_base", "shift_label"])
+@pytest.mark.parametrize(
+    "missing", ["empty", "lambda_base", "loss_decay_gamma", "shift_label"]
+)
 def test_exact_resume_rejects_incomplete_domino_topology(missing):
     args = _trainer_args()
     topology = json.loads(json.dumps(_logical_training_topology(args, 2)))
     if missing == "empty":
         topology = {}
-    elif missing == "lambda_base":
-        del topology["training_objective"]["lambda_base"]
+    elif missing in {"lambda_base", "loss_decay_gamma"}:
+        del topology["training_objective"][missing]
     else:
         del topology["draft_model_semantics"]["shift_label"]
     with pytest.raises(RuntimeError, match="complete Domino training_topology"):

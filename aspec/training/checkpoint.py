@@ -215,7 +215,7 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
         objective = saved_topology.get("training_objective") or {}
         semantics = saved_topology.get("draft_model_semantics") or {}
         missing = [
-            key for key in ("lambda_base", "block_size", "loss")
+            key for key in ("lambda_base", "block_size", "loss", "loss_decay_gamma")
             if key not in objective
         ]
         missing += [
