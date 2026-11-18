@@ -74,8 +74,8 @@ teacher row.
 
 The training wrapper always supplies explicit visibility. A direct
 `JetSpecDraftModel.forward` call must pass `block_mask`, `draft_attention_mask` or
-`direct_cp_metadata`; otherwise it fails closed instead of silently running
-bidirectional SDPA. The CPU dense-mask path also rejects packed `ctx_doc_ids`,
+`direct_cp_metadata`; per-layer lists must cover every Draft layer without `None`
+entries. Otherwise it fails closed instead of silently running bidirectional SDPA. The CPU dense-mask path also rejects packed `ctx_doc_ids`,
 because the dense helper cannot preserve document isolation.
 
 ## Minimal numerical use

@@ -251,6 +251,36 @@ def test_target_projection_uses_bounded_token_chunks(monkeypatch):
     assert max(rows_per_projection) <= 3
 
 
+def test_chunked_backward_preserves_forward_autocast_state():
+    outside = make_model(temperature=1.5)
+    inside = make_model(temperature=1.5)
+    inputs, inside_inputs = make_inputs(batch=2), make_inputs(batch=2)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        result, _ = run_and_capture(outside, inputs)
+    result[0].backward()
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        expected, _ = run_and_capture(inside, inside_inputs)
+        expected[0].backward()
+
+    torch.testing.assert_close(result[0], expected[0], rtol=2e-5, atol=2e-6)
+    _assert_parameter_gradients(outside, inside)
+
+
+def test_chunked_backward_restores_autocast_dtype_for_bf16_teacher():
+    model = make_model()
+    inputs = make_inputs()
+    inputs["hidden_states_list"] = inputs["hidden_states_list"].to(torch.bfloat16)
+    inputs["last_hidden_states"] = inputs["last_hidden_states"].to(torch.bfloat16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        result, _ = run_and_capture(model, inputs)
+    result[0].backward()
+    assert torch.isfinite(result[0])
+    for parameter in model.parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all()
+
+
 def test_cpu_causal_path_rejects_packed_documents():
     model = make_model()
     inputs = make_inputs()
@@ -258,6 +288,18 @@ def test_cpu_causal_path_rejects_packed_documents():
     inputs["ctx_doc_ids"] = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1]])
     with pytest.raises(ValueError, match="packed ctx_doc_ids"):
         model(**inputs)
+
+
+def test_direct_draft_rejects_layer_without_effective_direct_cp():
+    draft = JetSpecDraftModel(make_config(num_hidden_layers=2))
+    with pytest.raises(ValueError, match="every Draft layer"):
+        draft.forward(
+            draft_input_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_feature=torch.zeros(1, 12, 16),
+            draft_position_ids=torch.zeros(1, 10, dtype=torch.long),
+            context_position_ids=torch.zeros(1, 12, dtype=torch.long),
+            direct_cp_metadata=[None, None],
+        )
 
 
 def test_direct_draft_forward_requires_explicit_causal_visibility():

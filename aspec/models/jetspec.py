@@ -28,6 +28,9 @@ class _ChunkedForwardKL(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, draft_logits, hidden, lm_head_weight, temperature, chunk_rows, active):
+        device_type = hidden.device.type
+        ctx.autocast_enabled = torch.is_autocast_enabled(device_type)
+        ctx.autocast_dtype = torch.get_autocast_dtype(device_type)
         rows = draft_logits.shape[0]
         kl = torch.zeros(rows, dtype=torch.float32, device=draft_logits.device)
         for start in range(0, active.numel(), chunk_rows):
@@ -51,19 +54,25 @@ class _ChunkedForwardKL(torch.autograd.Function):
         draft_logits, hidden, lm_head_weight, active = ctx.saved_tensors
         temperature = ctx.temperature
         gradient = torch.zeros_like(draft_logits)
-        for start in range(0, active.numel(), ctx.chunk_rows):
-            row_ids = active[start : start + ctx.chunk_rows]
-            target_logits = F.linear(
-                hidden.index_select(0, row_ids), lm_head_weight
-            ).float()
-            p = F.softmax(target_logits / temperature, dim=-1)
-            q = F.softmax(
-                draft_logits.index_select(0, row_ids).float() / temperature, dim=-1
-            )
-            scale = grad_kl.index_select(0, row_ids).float().unsqueeze(-1)
-            gradient.index_put_(
-                (row_ids,), ((q - p) * temperature * scale).to(gradient.dtype)
-            )
+        with torch.autocast(
+            device_type=hidden.device.type,
+            dtype=ctx.autocast_dtype,
+            enabled=ctx.autocast_enabled,
+        ):
+            for start in range(0, active.numel(), ctx.chunk_rows):
+                row_ids = active[start : start + ctx.chunk_rows]
+                target_logits = F.linear(
+                    hidden.index_select(0, row_ids), lm_head_weight
+                ).float()
+                p = F.softmax(target_logits / temperature, dim=-1)
+                q = F.softmax(
+                    draft_logits.index_select(0, row_ids).float() / temperature,
+                    dim=-1,
+                )
+                scale = grad_kl.index_select(0, row_ids).float().unsqueeze(-1)
+                gradient.index_put_(
+                    (row_ids,), ((q - p) * temperature * scale).to(gradient.dtype)
+                )
         return gradient, None, None, None, None, None
 
 
