@@ -146,3 +146,66 @@ def test_fused_rejects_dense_mask():
     mask = torch.ones(1, 8, 4, 41, dtype=torch.bool, device="cuda")
     with pytest.raises(NotImplementedError, match="attn_mask"):
         fused_ops.fused_absorbed_mla_attention(**tensors, attn_mask=mask)
+
+
+def _make_core_tensors(*, device="cuda", batch=1, query=8, key=41, heads=4, latent=32, rope=16):
+    generator = torch.Generator(device=device).manual_seed(41)
+    return (
+        torch.randn(batch, query, heads, latent, generator=generator, device=device, dtype=torch.float16),
+        torch.randn(batch, query, heads, rope, generator=generator, device=device, dtype=torch.float16),
+        torch.randn(batch, key, latent, generator=generator, device=device, dtype=torch.float16),
+        torch.randn(batch, key, rope, generator=generator, device=device, dtype=torch.float16),
+    )
+
+
+def test_fused_core_rejects_mismatched_compressed_kv():
+    q_lat, q_rope, _, k_rope = _make_core_tensors()
+    with pytest.raises(ValueError, match="compressed_kv"):
+        fused_ops.fused_absorbed_mla_core(
+            q_lat,
+            q_rope,
+            torch.zeros(2, 41, 32, device="cuda", dtype=torch.float16),
+            torch.zeros(2, 41, 16, device="cuda", dtype=torch.float16),
+            softmax_scale=0.1,
+        )
+    with pytest.raises(ValueError, match="compressed_kv"):
+        fused_ops.fused_absorbed_mla_core(
+            q_lat,
+            q_rope,
+            torch.zeros(1, 41, 16, device="cuda", dtype=torch.float16),
+            k_rope,
+            softmax_scale=0.1,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_fused_core_rejects_cross_device_inputs():
+    q_lat, q_rope, compressed_kv, k_rope = _make_core_tensors(device="cuda:0")
+    with pytest.raises(ValueError, match="same device"):
+        fused_ops.fused_absorbed_mla_core(
+            q_lat,
+            q_rope,
+            compressed_kv.to("cuda:1"),
+            k_rope.to("cuda:1"),
+            softmax_scale=0.1,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_fused_core_runs_on_input_device_when_not_current():
+    previous = torch.cuda.current_device()
+    try:
+        torch.cuda.set_device(0)
+        q_lat, q_rope, compressed_kv, k_rope = _make_core_tensors(device="cuda:1")
+        for tensor in (q_lat, q_rope, compressed_kv, k_rope):
+            tensor.requires_grad_(True)
+        output = fused_ops.fused_absorbed_mla_core(
+            q_lat, q_rope, compressed_kv, k_rope, softmax_scale=0.1
+        )
+        assert output.device == torch.device("cuda:1")
+        output.float().sum().backward()
+        for tensor in (q_lat, q_rope, compressed_kv, k_rope):
+            assert tensor.grad is not None
+            assert tensor.grad.device == torch.device("cuda:1")
+    finally:
+        torch.cuda.set_device(previous)

@@ -534,12 +534,16 @@ class _AbsorbedMLAFusedCore(torch.autograd.Function):
         ):
             if tensor.dtype != q_lat.dtype:
                 raise ValueError(f"{name} dtype must match q_lat")
+            if tensor.device != q_lat.device:
+                raise ValueError(f"{name} must be on the same device as q_lat")
         if q_lat.ndim != 4 or q_rope.ndim != 4 or compressed_kv.ndim != 3:
             raise ValueError("fused absorbed MLA expects [B,S,H,K], [B,S,H,Dr], [B,T,K]")
         if q_rope.shape[:3] != q_lat.shape[:3]:
             raise ValueError("q_rope must match q_lat batch/query/head axes")
         if k_rope.shape != (compressed_kv.size(0), compressed_kv.size(1), q_rope.size(-1)):
             raise ValueError("k_rope must be [B,T,Dr]")
+        if compressed_kv.size(0) != q_lat.size(0) or compressed_kv.size(2) != q_lat.size(3):
+            raise ValueError("compressed_kv must match q_lat batch and latent dimensions")
 
         q_lat = q_lat.contiguous()
         q_rope = q_rope.contiguous()
@@ -559,41 +563,42 @@ class _AbsorbedMLAFusedCore(torch.autograd.Function):
             key_dim, rope_dim, _FWD_TILE_M, _FWD_TILE_N, query_len
         )
         grid = (triton.cdiv(query_len, block_m), batch * num_heads)
-        _absorbed_mla_fwd_kernel[grid](
-            q_lat,
-            q_rope,
-            compressed_kv,
-            k_rope,
-            output,
-            lse,
-            query_len,
-            key_len,
-            num_heads,
-            key_dim,
-            rope_dim,
-            softmax_scale,
-            q_lat.stride(0),
-            q_lat.stride(1),
-            q_lat.stride(2),
-            q_rope.stride(0),
-            q_rope.stride(1),
-            q_rope.stride(2),
-            compressed_kv.stride(0),
-            compressed_kv.stride(1),
-            k_rope.stride(0),
-            k_rope.stride(1),
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            lse.stride(0),
-            lse.stride(1),
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            BLOCK_DR=block_dr,
-            num_warps=_FWD_WARPS,
-            num_stages=_FWD_STAGES,
-        )
+        with torch.cuda.device(q_lat.device):
+            _absorbed_mla_fwd_kernel[grid](
+                q_lat,
+                q_rope,
+                compressed_kv,
+                k_rope,
+                output,
+                lse,
+                query_len,
+                key_len,
+                num_heads,
+                key_dim,
+                rope_dim,
+                softmax_scale,
+                q_lat.stride(0),
+                q_lat.stride(1),
+                q_lat.stride(2),
+                q_rope.stride(0),
+                q_rope.stride(1),
+                q_rope.stride(2),
+                compressed_kv.stride(0),
+                compressed_kv.stride(1),
+                k_rope.stride(0),
+                k_rope.stride(1),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                lse.stride(0),
+                lse.stride(1),
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                BLOCK_DR=block_dr,
+                num_warps=_FWD_WARPS,
+                num_stages=_FWD_STAGES,
+            )
         ctx.save_for_backward(q_lat, q_rope, compressed_kv, k_rope, output, lse)
         ctx.softmax_scale = float(softmax_scale)
         return output
@@ -601,6 +606,8 @@ class _AbsorbedMLAFusedCore(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         q_lat, q_rope, compressed_kv, k_rope, output, lse = ctx.saved_tensors
+        if grad_output.device != q_lat.device:
+            raise ValueError("grad_output must be on q_lat.device")
         grad_output = grad_output.contiguous()
         batch, query_len, num_heads, key_dim = q_lat.shape
         key_len = compressed_kv.size(1)
@@ -615,47 +622,48 @@ class _AbsorbedMLAFusedCore(torch.autograd.Function):
         )
 
         grid_m = (triton.cdiv(query_len, dq_m), batch * num_heads)
-        _absorbed_mla_bwd_dq_kernel[grid_m](
-            q_lat,
-            q_rope,
-            compressed_kv,
-            k_rope,
-            grad_output,
-            lse,
-            d_i,
-            grad_q_lat,
-            grad_q_rope,
-            query_len,
-            key_len,
-            num_heads,
-            key_dim,
-            rope_dim,
-            scale,
-            q_lat.stride(0),
-            q_lat.stride(1),
-            q_lat.stride(2),
-            q_rope.stride(0),
-            q_rope.stride(1),
-            q_rope.stride(2),
-            compressed_kv.stride(0),
-            compressed_kv.stride(1),
-            k_rope.stride(0),
-            k_rope.stride(1),
-            grad_output.stride(0),
-            grad_output.stride(1),
-            grad_output.stride(2),
-            lse.stride(0),
-            lse.stride(1),
-            d_i.stride(0),
-            d_i.stride(1),
-            d_i.stride(2),
-            BLOCK_M=dq_m,
-            BLOCK_N=dq_n,
-            BLOCK_K=dq_k,
-            BLOCK_DR=dq_dr,
-            num_warps=_DQ_WARPS,
-            num_stages=_DQ_STAGES,
-        )
+        with torch.cuda.device(q_lat.device):
+            _absorbed_mla_bwd_dq_kernel[grid_m](
+                q_lat,
+                q_rope,
+                compressed_kv,
+                k_rope,
+                grad_output,
+                lse,
+                d_i,
+                grad_q_lat,
+                grad_q_rope,
+                query_len,
+                key_len,
+                num_heads,
+                key_dim,
+                rope_dim,
+                scale,
+                q_lat.stride(0),
+                q_lat.stride(1),
+                q_lat.stride(2),
+                q_rope.stride(0),
+                q_rope.stride(1),
+                q_rope.stride(2),
+                compressed_kv.stride(0),
+                compressed_kv.stride(1),
+                k_rope.stride(0),
+                k_rope.stride(1),
+                grad_output.stride(0),
+                grad_output.stride(1),
+                grad_output.stride(2),
+                lse.stride(0),
+                lse.stride(1),
+                d_i.stride(0),
+                d_i.stride(1),
+                d_i.stride(2),
+                BLOCK_M=dq_m,
+                BLOCK_N=dq_n,
+                BLOCK_K=dq_k,
+                BLOCK_DR=dq_dr,
+                num_warps=_DQ_WARPS,
+                num_stages=_DQ_STAGES,
+            )
 
         dk_m, dk_n, dk_k, dk_dr = _tile_sizes(
             key_dim, rope_dim, _DKDV_TILE_M, _DKDV_TILE_N, query_len
@@ -673,54 +681,55 @@ class _AbsorbedMLAFusedCore(torch.autograd.Function):
             dtype=torch.float32,
         )
         grid_n = (triton.cdiv(key_len, dk_n), batch, num_groups)
-        _absorbed_mla_bwd_dkdv_kernel[grid_n](
-            q_lat,
-            q_rope,
-            compressed_kv,
-            k_rope,
-            grad_output,
-            lse,
-            d_i,
-            dc_part,
-            dkr_part,
-            query_len,
-            key_len,
-            num_heads,
-            key_dim,
-            rope_dim,
-            scale,
-            q_lat.stride(0),
-            q_lat.stride(1),
-            q_lat.stride(2),
-            q_rope.stride(0),
-            q_rope.stride(1),
-            q_rope.stride(2),
-            compressed_kv.stride(0),
-            compressed_kv.stride(1),
-            k_rope.stride(0),
-            k_rope.stride(1),
-            grad_output.stride(0),
-            grad_output.stride(1),
-            grad_output.stride(2),
-            lse.stride(0),
-            lse.stride(1),
-            d_i.stride(0),
-            d_i.stride(1),
-            d_i.stride(2),
-            dc_part.stride(0),
-            dc_part.stride(1),
-            dc_part.stride(2),
-            dkr_part.stride(0),
-            dkr_part.stride(1),
-            dkr_part.stride(2),
-            BLOCK_M=dk_m,
-            BLOCK_N=dk_n,
-            BLOCK_K=dk_k,
-            BLOCK_DR=dk_dr,
-            GROUP=group,
-            num_warps=_DKDV_WARPS,
-            num_stages=_DKDV_STAGES,
-        )
+        with torch.cuda.device(q_lat.device):
+            _absorbed_mla_bwd_dkdv_kernel[grid_n](
+                q_lat,
+                q_rope,
+                compressed_kv,
+                k_rope,
+                grad_output,
+                lse,
+                d_i,
+                dc_part,
+                dkr_part,
+                query_len,
+                key_len,
+                num_heads,
+                key_dim,
+                rope_dim,
+                scale,
+                q_lat.stride(0),
+                q_lat.stride(1),
+                q_lat.stride(2),
+                q_rope.stride(0),
+                q_rope.stride(1),
+                q_rope.stride(2),
+                compressed_kv.stride(0),
+                compressed_kv.stride(1),
+                k_rope.stride(0),
+                k_rope.stride(1),
+                grad_output.stride(0),
+                grad_output.stride(1),
+                grad_output.stride(2),
+                lse.stride(0),
+                lse.stride(1),
+                d_i.stride(0),
+                d_i.stride(1),
+                d_i.stride(2),
+                dc_part.stride(0),
+                dc_part.stride(1),
+                dc_part.stride(2),
+                dkr_part.stride(0),
+                dkr_part.stride(1),
+                dkr_part.stride(2),
+                BLOCK_M=dk_m,
+                BLOCK_N=dk_n,
+                BLOCK_K=dk_k,
+                BLOCK_DR=dk_dr,
+                GROUP=group,
+                num_warps=_DKDV_WARPS,
+                num_stages=_DKDV_STAGES,
+            )
         grad_c_kv = dc_part.sum(dim=0).to(compressed_kv.dtype)
         grad_k_rope = dkr_part.sum(dim=0).to(k_rope.dtype)
         return grad_q_lat, grad_q_rope, grad_c_kv, grad_k_rope, None
@@ -768,6 +777,14 @@ def fused_absorbed_mla_attention(
         )
     if q_nope.ndim != 4 or q_rope.ndim != 4:
         raise ValueError("q_nope and q_rope must be [B, S, H, D]")
+    for name, tensor in (
+        ("q_rope", q_rope),
+        ("compressed_kv", compressed_kv),
+        ("k_rope", k_rope),
+        ("kv_b_proj_weight", kv_b_proj_weight),
+    ):
+        if tensor.device != q_nope.device:
+            raise ValueError(f"{name} must be on the same device as q_nope")
     batch, query_len, num_heads, qk_nope_head_dim = q_nope.shape
     qk_rope_head_dim = q_rope.size(-1)
     if compressed_kv.ndim != 3 or compressed_kv.size(0) != batch:
