@@ -181,6 +181,18 @@ def test_trainer_aggregates_real_mixed_component(monkeypatch):
     assert eval_output["eval/avg_loss"] == pytest.approx(11 / 4)
 
 
+def test_plan_rejects_explicit_cudnn_gqa_mode(tmp_path):
+    raw = json.loads(_DRAFT_JSON.read_text(encoding="utf-8"))
+    raw["cudnn_gqa_mode"] = "native"
+    draft_config = tmp_path / "domino_cudnn.json"
+    draft_config.write_text(json.dumps(raw), encoding="utf-8")
+    target = f"model.target_model_path={_fake_qwen_target(tmp_path)}"
+    args = [target, f"model.draft_model_config={draft_config}"]
+    with pytest.raises(PlanCompileError, match="cudnn_gqa_mode"):
+        config = load_config(config_path=str(_EXAMPLE), cli_args=args)
+        compile_execution_plan(config, config_path=str(_EXAMPLE), cli_args=args)
+
+
 @pytest.mark.parametrize("override, error", _ILLEGAL_OVERRIDES)
 def test_plan_rejects_unsupported_domino_combinations(tmp_path, override, error):
     target = f"model.target_model_path={_fake_qwen_target(tmp_path)}"
@@ -237,6 +249,22 @@ def test_trainer_builds_domino_wrapper_and_pins_block_size():
     trainer.block_size = 4
     with pytest.raises(ValueError):
         trainer._build_draft_model(_tiny_config())
+
+
+@pytest.mark.parametrize("missing", ["empty", "lambda_base", "shift_label"])
+def test_exact_resume_rejects_incomplete_domino_topology(missing):
+    args = _trainer_args()
+    topology = json.loads(json.dumps(_logical_training_topology(args, 2)))
+    if missing == "empty":
+        topology = {}
+    elif missing == "lambda_base":
+        del topology["training_objective"]["lambda_base"]
+    else:
+        del topology["draft_model_semantics"]["shift_label"]
+    with pytest.raises(RuntimeError, match="complete Domino training_topology"):
+        _validate_exact_resume_topology(
+            args, {"world_size": 2, "training_topology": topology}
+        )
 
 
 def test_exact_resume_requires_topology_for_domino():

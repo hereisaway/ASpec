@@ -25,23 +25,42 @@ Target GPU plus two Draft GPUs at 4K (three GPUs total).
 
 ## Running
 
-Compile the example before launching GPUs, then train with the same recipe:
+Prepare the Target in a separate environment and keep it running on GPU 0:
+
+```bash
+aspec patch-sglang
+CUDA_VISIBLE_DEVICES=0 aspec target \
+  --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B
+```
+
+Compile the example, then train with two Draft GPUs (GPUs 1 and 2):
 
 ```bash
 aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml --dry-run \
   model.target_model_path=/path/to/Qwen3-8B
-RAY_ADDRESS=local aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
   model.target_model_path=/path/to/Qwen3-8B
 ```
 
-For exact recovery, point at a complete checkpoint with `training.load_path` and
-write to a fresh `output_dir`; keep `training.continual_training=false` (the default):
+For exact recovery, stop the first run at step 4 while keeping `lr_total_steps=8`,
+then resume that checkpoint into a fresh directory:
 
 ```bash
-aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
   model.target_model_path=/path/to/Qwen3-8B \
-  training.load_path=outputs/domino_qwen3_8b_4k_tcp/checkpoints \
-  training.continual_training=false output_dir=outputs/domino_qwen3_8b_4k_tcp_resumed
+  training.num_train_steps=4 training.lr_total_steps=8 \
+  output_dir=outputs/domino_qwen3_8b_4k_tcp_step4
+
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B \
+  training.load_path=outputs/domino_qwen3_8b_4k_tcp_step4/checkpoints \
+  training.num_train_steps=8 training.lr_total_steps=8 \
+  training.continual_training=false \
+  output_dir=outputs/domino_qwen3_8b_4k_tcp_resumed
 ```
 
 The example is a short functional smoke-test recipe, not evidence that GPU execution

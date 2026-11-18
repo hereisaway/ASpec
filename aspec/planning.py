@@ -395,6 +395,11 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
             raise PlanCompileError(
                 "Domino block_size must match training.dflash_block_size"
             )
+        if raw.get("cudnn_gqa_mode", "auto") != "auto":
+            raise PlanCompileError(
+                "Domino requires cudnn_gqa_mode=auto; the packed FlexAttention "
+                "mask controls visibility"
+            )
         backend = _select(config, "training.attention_backend")
         if backend != "flex_attention":
             raise PlanCompileError(

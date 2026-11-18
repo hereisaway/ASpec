@@ -211,6 +211,23 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
         # compatibility while every newly published checkpoint records the
         # full logical parallelism contract below.
         return
+    if getattr(args, "draft_algorithm", None) == "domino":
+        objective = saved_topology.get("training_objective") or {}
+        semantics = saved_topology.get("draft_model_semantics") or {}
+        missing = [
+            key for key in ("lambda_base", "block_size", "loss")
+            if key not in objective
+        ]
+        missing += [
+            key for key in ("shift_label", "pure_draft_prefix_len")
+            if key not in semantics
+        ]
+        if missing:
+            raise RuntimeError(
+                "Exact resume requires complete Domino training_topology; "
+                f"missing {missing}. Use continual_training=true for a "
+                "weights-only new stage."
+            )
     if current_policy.get("dsa") is not None:
         # Chunk workspace is an execution bound, not the DSA objective. Preserve
         # every recorded semantic field while allowing a different memory budget.
