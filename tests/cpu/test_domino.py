@@ -432,3 +432,109 @@ def test_plain_dflash_wrapper_keeps_unshifted_layout():
     assert model.label_start == 0
     result, _ = run_and_capture(model, make_inputs())
     assert int(result[4][0]) == 0
+
+
+def _plain_dflash_with_domino_backbone(domino):
+    draft = domino.draft_model
+    config = DFlashConfig(
+        hidden_size=draft.config.hidden_size,
+        intermediate_size=draft.config.intermediate_size,
+        num_hidden_layers=draft.config.num_hidden_layers,
+        num_attention_heads=draft.config.num_attention_heads,
+        num_key_value_heads=draft.config.num_key_value_heads,
+        head_dim=draft.config.head_dim,
+        vocab_size=draft.config.vocab_size,
+        num_target_layers=draft.config.num_target_layers,
+        target_hidden_size=draft.config.target_hidden_size,
+        target_num_hidden_layers=draft.config.target_num_hidden_layers,
+        target_layer_ids=list(draft.config.target_layer_ids),
+        mask_token_id=draft.config.mask_token_id,
+        max_position_embeddings=draft.config.max_position_embeddings,
+        block_size=draft.config.block_size,
+        rms_norm_eps=draft.config.rms_norm_eps,
+    )
+    plain_draft = DFlashDraftModel(config)
+    backbone = {
+        name: value
+        for name, value in draft.state_dict().items()
+        if not name.startswith(("prefix_gru.", "embed_proj."))
+    }
+    plain_draft.load_state_dict(backbone, strict=True)
+    plain_draft.embed_tokens.requires_grad_(False)
+    return DFlashModel(
+        plain_draft,
+        block_size=domino.block_size,
+        num_anchors=domino.num_anchors,
+        attention_backend="sdpa",
+        loss_decay_gamma=domino.loss_decay_gamma,
+    )
+
+
+@pytest.mark.parametrize(
+    "field", ["ctx_doc_ids", "packed_context_positions", "packed_document_lengths"]
+)
+def test_packed_inputs_are_rejected_before_backbone(field):
+    model = make_model(shift_label=True)
+    inputs = make_inputs()
+    if field == "packed_document_lengths":
+        inputs[field] = (inputs["input_ids"].size(1),)
+    else:
+        inputs[field] = torch.zeros_like(inputs["input_ids"])
+    with pytest.raises(NotImplementedError, match="packed"):
+        model(**inputs)
+
+
+def test_unshifted_lambda_one_matches_plain_dflash_loss_and_gradients():
+    domino = make_model(shift_label=False, lambda_base=1.0, loss_decay_gamma=0.0)
+    plain = _plain_dflash_with_domino_backbone(domino)
+    inputs = make_inputs()
+    domino_result, _ = run_and_capture(domino, inputs)
+    plain_result, _ = run_and_capture(plain, inputs)
+    torch.testing.assert_close(
+        domino_result[0], plain_result[0], rtol=2e-5, atol=2e-6
+    )
+
+    domino_result[0].backward()
+    plain_result[0].backward()
+    domino_parameters = dict(domino.named_parameters())
+    for name, parameter in plain.named_parameters():
+        actual = domino_parameters[name]
+        assert (actual.grad is None) == (parameter.grad is None), name
+        if parameter.grad is not None:
+            torch.testing.assert_close(
+                actual.grad, parameter.grad, rtol=2e-5, atol=2e-6, msg=name
+            )
+    for name in (
+        "draft_model.prefix_gru.weight_ih_l0",
+        "draft_model.embed_proj.0.weight",
+        "draft_model.embed_proj.2.weight",
+    ):
+        grad = domino_parameters[name].grad
+        assert grad is None or torch.count_nonzero(grad) == 0, name
+
+
+def test_correction_ignores_future_block_tokens():
+    model = make_model(shift_label=True)
+    draft = model.draft_model
+    block_size = model.block_size
+    blocks = 2
+    generator = torch.Generator().manual_seed(5)
+    hidden = torch.randn(
+        1, blocks * block_size, draft.hidden_size, generator=generator
+    )
+    base_logits = torch.randn(
+        1, blocks * block_size, draft.config.vocab_size, generator=generator
+    )
+    input_ids = (
+        torch.arange(blocks * block_size, dtype=torch.long).reshape(1, -1)
+        % draft.config.vocab_size
+    )
+    anchors = torch.tensor([[0, block_size]])
+    corrected = draft.correct_logits(hidden, base_logits, input_ids, anchors)
+
+    future = input_ids.clone()
+    future[0, -1] = (future[0, -1] + 1) % draft.config.vocab_size
+    changed = draft.correct_logits(hidden, base_logits, future, anchors)
+
+    torch.testing.assert_close(corrected[:, :-1], changed[:, :-1], rtol=0, atol=0)
+    assert not torch.equal(corrected[:, -1:], changed[:, -1:])

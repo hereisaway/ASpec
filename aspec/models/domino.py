@@ -44,6 +44,31 @@ class DominoModel(DFlashModel):
         self.prediction_start = 1 - self.label_start
         self.set_lambda_base(lambda_base)
 
+    def _prepare_draft_prefix(
+        self,
+        input_ids,
+        last_hidden_states,
+        attention_mask,
+        draft_prefix,
+        *packed_metadata,
+    ):
+        ctx_doc_ids, _, packed_context_positions, packed_document_lengths = packed_metadata
+        if any(
+            value is not None
+            for value in (ctx_doc_ids, packed_context_positions, packed_document_lengths)
+        ):
+            raise NotImplementedError(
+                "Domino supports padded, non-packed inputs only; packed documents "
+                "or sharded context are rejected before backbone execution"
+            )
+        return super()._prepare_draft_prefix(
+            input_ids,
+            last_hidden_states,
+            attention_mask,
+            draft_prefix,
+            *packed_metadata,
+        )
+
     def set_lambda_base(self, lambda_base) -> None:
         """Set the backbone-only loss weight for the current step."""
         if (
