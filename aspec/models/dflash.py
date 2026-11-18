@@ -143,6 +143,9 @@ class DFlashModel(nn.Module):
     """
 
     prediction_start = 1
+    # First label offset relative to an anchor. Base DFlash predicts the token at
+    # the anchor itself (masked out); shifted-layout variants start at anchor + 1.
+    label_start = 0
 
     def __init__(
         self,
@@ -437,6 +440,53 @@ class DFlashModel(nn.Module):
         objective_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
         return logits.new_zeros(()), {}
+
+    def _training_loss(
+        self,
+        *,
+        logits: torch.Tensor,
+        draft_hidden: torch.Tensor,
+        target_ids: torch.Tensor,
+        last_hidden_states: Optional[torch.Tensor],
+        lm_head_weight: torch.Tensor,
+        safe_label_indices: torch.Tensor,
+        packed_context_positions: Optional[torch.Tensor],
+        sequence_length: int,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-token objective and the logits used for reporting.
+
+        Base DFlash applies ``ce_loss_alpha * CE + l1_loss_alpha * L1``.
+        Algorithm wrappers may replace the objective (and the logits used for
+        accuracy) without duplicating anchor, mask or reduction bookkeeping.
+        """
+        vocab_size = logits.size(-1)
+        flat_logits = logits.view(-1, vocab_size)
+        flat_targets = target_ids.view(-1)
+        ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+
+        loss_per_token = self.ce_loss_alpha * ce_per_token
+        if self.uses_target_distribution:
+            if last_hidden_states is None:
+                raise ValueError(
+                    "DFlash L1 distillation (l1_loss_alpha > 0) requires target "
+                    "last_hidden_states; set inference.store_last_hidden_states=true in the "
+                    "run config."
+                )
+            tgt_idx = (safe_label_indices - 1).clamp(min=0)
+            aligned_hidden = self._align_target_hidden_states(
+                last_hidden_states,
+                tgt_idx,
+                global_sequence_length=sequence_length,
+                packed_context_positions=packed_context_positions,
+            )
+            target_logits = F.linear(aligned_hidden, lm_head_weight).view(-1, vocab_size)
+            target_probs = torch.softmax(target_logits.float(), dim=-1)
+            draft_probs = torch.softmax(flat_logits.float(), dim=-1)
+            l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
+            loss_per_token = loss_per_token + self.l1_loss_alpha * l1_per_token
+        return loss_per_token, ce_per_token, logits
 
     def _align_target_hidden_states(
         self,
@@ -1094,8 +1144,10 @@ class DFlashModel(nn.Module):
         logits = self._compute_logits(draft_hidden, lm_head_weight)
 
         # 8. Compute labels and weight mask (SpecForge pattern)
-        # Labels: same-position prediction (position k predicts token at anchor+k)
-        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
+        # Labels: same-position prediction (position k predicts token at anchor + label_start + k)
+        label_offsets = torch.arange(
+            self.label_start, self.label_start + self.block_size, device=device
+        ).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets  # [B, n_blocks, block_size]
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
@@ -1127,34 +1179,24 @@ class DFlashModel(nn.Module):
         # our objective weighting is an addition to the training signal, not the metric.
         binary_eval_mask = weight_mask.view(-1)
 
-        # 9. Per-token loss: ce_loss_alpha*CE + l1_loss_alpha*L1.
-        vocab_size = logits.size(-1)
-        flat_logits = logits.view(-1, vocab_size)
+        # 9. Per-token objective, algorithm-specific logits and reporting values.
+        loss_per_token, loss_per_token_by_position, logits = self._training_loss(
+            logits=logits,
+            draft_hidden=draft_hidden,
+            target_ids=target_ids,
+            last_hidden_states=last_hidden_states,
+            lm_head_weight=lm_head_weight,
+            safe_label_indices=safe_label_indices,
+            packed_context_positions=packed_context_positions,
+            sequence_length=seq_len,
+            input_ids=input_ids,
+            anchor_positions=anchor_positions,
+        )
+        loss_per_token_by_position = loss_per_token_by_position.view(
+            bsz, n_blocks, self.block_size
+        )
+        flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
-        ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-
-        loss_per_token = self.ce_loss_alpha * ce_per_token
-        if self.uses_target_distribution:
-            if last_hidden_states is None:
-                raise ValueError(
-                    "DFlash L1 distillation (l1_loss_alpha > 0) requires target "
-                    "last_hidden_states; set inference.store_last_hidden_states=true in the "
-                    "run config."
-                )
-            tgt_idx = (safe_label_indices - 1).clamp(min=0)
-            aligned_hidden = self._align_target_hidden_states(
-                last_hidden_states,
-                tgt_idx,
-                global_sequence_length=seq_len,
-                packed_context_positions=packed_context_positions,
-            )
-            target_logits = F.linear(aligned_hidden, lm_head_weight).view(-1, vocab_size)
-            target_probs = torch.softmax(target_logits.float(), dim=-1)
-            draft_probs = torch.softmax(flat_logits.float(), dim=-1)
-            l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
-            loss_per_token = loss_per_token + self.l1_loss_alpha * l1_per_token
-
-        loss_per_token_by_position = ce_per_token.view(bsz, n_blocks, self.block_size)
 
         objective_weights = weight_mask
         if (

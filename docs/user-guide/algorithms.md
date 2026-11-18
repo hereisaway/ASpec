@@ -61,6 +61,16 @@ The [P-EAGLE model/loss API](peagle.md) provides a dense unsampled Qwen3 paralle
 Draft and forward-KL objective with independent numerical checks. Public training,
 COD sampling, recovery, export and consumer validation remain pending.
 
+## Domino core prerequisite
+
+The [Domino model/loss API](domino.md) adds a GRU-conditioned causal correction head
+on the retained DFlash block backbone and mixes corrected with backbone-only
+cross-entropy through `lambda_base`. Both documented label layouts are explicit:
+the unshifted DFlash convention and the official shifted convention
+(`shift_label=true`, `pure_draft_prefix_len=1`). Dense full attention is enforced.
+Public training selection, the `lambda_base` curriculum, recovery, export and
+consumer validation remain pending.
+
 ## EAGLE4: two stages
 
 The Draft stage trains the full recurrent model. The candidate stage freezes the entire Draft,
