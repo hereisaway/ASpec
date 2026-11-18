@@ -237,6 +237,9 @@ class TrainingConfig:
     dflash_l1_loss_alpha: float = 0.0
     dflash_num_anchors: int = 512
     dflash_num_target_layers: int = 5
+    # Domino mixes corrected and backbone-only CE as
+    # (1 - lambda_base) * corrected + lambda_base * backbone.
+    domino_lambda_base: float = 0.3
     # Pack multiple complete documents into one fixed row. The controller owns
     # grouping; the trainer preserves document boundaries for attention/RoPE.
     dflash_packing: bool = False

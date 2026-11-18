@@ -384,6 +384,43 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
         if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(alpha) or alpha < 0:
             raise PlanCompileError("DFlash2 selector_loss_alpha must be finite and non-negative")
 
+    if family == "domino":
+        from aspec.models.draft.domino import DominoConfig
+
+        try:
+            raw = DominoConfig.from_dict(raw).to_dict()
+        except (ValueError, TypeError) as exc:
+            raise PlanCompileError(str(exc)) from exc
+        if raw["block_size"] != _select(config, "training.dflash_block_size"):
+            raise PlanCompileError(
+                "Domino block_size must match training.dflash_block_size"
+            )
+        backend = _select(config, "training.attention_backend")
+        if backend != "sdpa":
+            raise PlanCompileError(
+                "Domino currently supports training.attention_backend=sdpa"
+            )
+        if _select(config, "training.draft_context_parallel_size", 1) != 1:
+            raise PlanCompileError("Domino currently supports draft_context_parallel_size=1")
+        if _select(config, "training.dflash_packing", False):
+            raise PlanCompileError(
+                "Domino rejects padded-only inputs; sequence packing is not implemented"
+            )
+        if _select(config, "training.compile_model", False):
+            raise PlanCompileError("Domino whole-model compile has not been enabled")
+        if _select(config, "training.dflash_loss_objective") != "decay":
+            raise PlanCompileError("Domino supports the decay loss objective only")
+        if (_select(config, "training.dflash_ce_loss_alpha") != 1.0
+                or _select(config, "training.dflash_l1_loss_alpha") != 0.0):
+            raise PlanCompileError(
+                "Domino replaces the CE/L1 mix; set dflash_ce_loss_alpha=1.0 "
+                "and dflash_l1_loss_alpha=0.0"
+            )
+        lambda_base = _select(config, "training.domino_lambda_base", 0.3)
+        if (isinstance(lambda_base, bool) or not isinstance(lambda_base, (int, float))
+                or not math.isfinite(lambda_base) or not 0.0 <= lambda_base <= 1.0):
+            raise PlanCompileError("domino_lambda_base must be a finite number in [0, 1]")
+
     target_layer_ids = raw.get("target_layer_ids")
     if not isinstance(target_layer_ids, list) or not target_layer_ids:
         raise PlanCompileError(
@@ -679,6 +716,10 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
         "target_layer_ids": target_layer_ids,
         "medusa_num_heads": raw.get("medusa_num_heads"),
         "medusa_num_layers": raw.get("medusa_num_layers"),
+        "domino_shift_label": raw.get("shift_label"),
+        "domino_pure_draft_prefix_len": raw.get("pure_draft_prefix_len"),
+        "domino_emb_dim": raw.get("emb_dim"),
+        "domino_gru_hidden_dim": raw.get("gru_hidden_dim"),
     }
 
 
@@ -1382,6 +1423,25 @@ def _workload(
             "lk_eta": _select(config, "training.lk_eta"),
             "gradient_checkpointing": _select(config, "training.gradient_checkpointing"),
         }
+    elif family == "domino":
+        objective = {
+            "family": "domino",
+            "loss": "mixed_corrected_backbone_ce",
+            "block_size": _select(config, "training.dflash_block_size"),
+            "num_anchors": _select(config, "training.dflash_num_anchors"),
+            "num_target_layers": _select(config, "training.dflash_num_target_layers"),
+            "loss_objective": _select(config, "training.dflash_loss_objective"),
+            "loss_decay_gamma": _select(config, "training.dflash_loss_decay_gamma"),
+            "ce_loss_alpha": 1.0,
+            "l1_loss_alpha": 0.0,
+            "lambda_base": _select(config, "training.domino_lambda_base", 0.3),
+            "shift_label": draft["domino_shift_label"],
+            "pure_draft_prefix_len": draft["domino_pure_draft_prefix_len"],
+            "correction_head": {
+                "emb_dim": draft["domino_emb_dim"],
+                "gru_hidden_dim": draft["domino_gru_hidden_dim"],
+            },
+        }
     elif family == "dspark":
         objective = {
             "family": family,
@@ -1432,7 +1492,7 @@ def _workload(
         objective["frozen_parts"] = (["draft_body", "embedding", "lm_head"]
                                      if draft["eagle4"]["stage"] == "candidate_head" else
                                      ["embedding", "candidate_head"] + (["lm_head"] if _select(config, "model.freeze_lm_head", False) else []))
-    if family in {"dspark", "dflash", "dflash2"}:
+    if family in {"dspark", "dflash", "dflash2", "domino"}:
         objective["anchor_sampling_scope"] = anchor_scope
     if draft.get("mtp_conditioning"):
         from aspec.config.mtp_conditioning import mtp_conditioning_semantics

@@ -21,6 +21,7 @@
 from aspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from aspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from aspec.models.draft.dflash2 import DFlash2Config, DFlash2DraftModel
+from aspec.models.draft.domino import DominoConfig, DominoDraftModel
 from aspec.models.draft.dspark import (
     DSparkConfig,
     DSparkDraftModel,
@@ -35,6 +36,8 @@ __all__ = [
     "DFlashDraftModel",
     "DFlash2Config",
     "DFlash2DraftModel",
+    "DominoConfig",
+    "DominoDraftModel",
     "DSparkConfig",
     "DSparkDraftModel",
     "K3DSparkConfig",

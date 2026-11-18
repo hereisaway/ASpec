@@ -1,10 +1,27 @@
-# Domino model and loss core
+# Domino Draft training
 
-This is the first prerequisite for [ASpec #38](https://github.com/inclusionAI/ASpec/issues/38).
-It provides `aspec.models.draft.domino.DominoDraftModel` and
+This implements [ASpec #38](https://github.com/inclusionAI/ASpec/issues/38) through
+`aspec.models.draft.domino.DominoDraftModel` and
 `aspec.models.domino.DominoModel`: a block-parallel DFlash backbone with a
-GRU-conditioned causal correction head. It is a model/loss API; the ASpec training
-CLI does not select this algorithm yet.
+GRU-conditioned causal correction head. The ASpec training CLI now selects this
+algorithm through `aspec/config/domino_qwen3_8b_draft_config.json`; the
+[example workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) runs one
+Target GPU plus one Draft GPU at 4K.
+
+## Training selection
+
+- Draft config: `aspec/config/domino_qwen3_8b_draft_config.json` (Qwen3-8B,
+  `block_size=16`, `shift_label=true`, `pure_draft_prefix_len=1`).
+- Example: `configs/examples/domino_qwen3_8b_4k_tcp.yaml` (SDPA, CP1, MBS1,
+  non-packing, REPLICATE, Store/TCP transport).
+- The trainer owns a fixed per-run `training.domino_lambda_base`; the curriculum
+  schedule is not implemented yet. Exact recovery records `lambda_base`, the label
+  layout and the correction-head dimensions.
+- The supported path fails closed outside dense full attention, padded inputs,
+  `attention_backend=sdpa`, `draft_context_parallel_size=1` and
+  `dflash_packing=false`. MoE, sparse attention, MTP conditioning, packing, CP>1
+  and whole-model compile are rejected during Plan compilation or configuration.
+
 
 ## Reference and selected scope
 
@@ -117,8 +134,7 @@ handling, empty supervision, and frozen Target/embedding behavior.
 
 ## Remaining work
 
-Trainer/Plan selection, the `lambda_base` curriculum schedule, a runnable recipe,
-exact resume of backbone/head/curriculum state, native export with strict reloading,
-Target bindings, proposal consumers and held-out backbone-vs-corrected observations
-remain pending. CPU numerical checks do not establish Qwen3-8B training quality,
-GPU throughput or decoding acceptance.
+The `lambda_base` curriculum schedule, a maintained recipe catalog entry, native
+export with strict reloading, Target bindings, proposal consumers and held-out
+backbone-vs-corrected observations remain pending. CPU numerical and Plan checks do
+not establish Qwen3-8B training quality, GPU throughput or decoding acceptance.
