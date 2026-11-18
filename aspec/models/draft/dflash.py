@@ -459,8 +459,8 @@ class DFlashAttention(nn.Module):
             draft_position_ids: [B, draft_len] — position IDs for draft tokens
             context_position_ids: [B, ctx_len] — position IDs for context tokens
             block_mask: FlexAttention BlockMask for block-causal attention
-            draft_attention_mask: Boolean [B, draft_len, ctx_len+draft_len] mask
-                for the non-FlexAttention fallback (for example CPU tests).
+            draft_attention_mask: Boolean [B, draft_len, ctx_len+draft_len]
+                mask for the non-FlexAttention fallback (for example CPU tests).
         """
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]

@@ -12,14 +12,15 @@ Target GPU plus one Draft GPU at 4K.
 
 - Draft config: `aspec/config/domino_qwen3_8b_draft_config.json` (Qwen3-8B,
   `block_size=16`, `shift_label=true`, `pure_draft_prefix_len=1`).
-- Example: `configs/examples/domino_qwen3_8b_4k_tcp.yaml` (SDPA, CP1, MBS1,
+- Example: `configs/examples/domino_qwen3_8b_4k_tcp.yaml` (FlexAttention, CP1, MBS1,
   non-packing, REPLICATE, Store/TCP transport).
 - The trainer owns a fixed per-run `training.domino_lambda_base`; the curriculum
   schedule is not implemented yet. Exact recovery records `lambda_base`, the label
   layout and the correction-head dimensions.
 - The supported path fails closed outside dense full attention, padded inputs,
-  `attention_backend=sdpa`, `draft_context_parallel_size=1` and
-  `dflash_packing=false`. MoE, sparse attention, MTP conditioning, packing, CP>1
+  `attention_backend=flex_attention`, `draft_context_parallel_size=1` and
+  `dflash_packing=false`. The CUDA FlexAttention mask and the CPU dense fallback
+  share the same block visibility; the CPU mask is built for contract tests only. MoE, sparse attention, MTP conditioning, packing, CP>1
   and whole-model compile are rejected during Plan compilation or configuration.
 
 ## Running
@@ -121,7 +122,9 @@ only for the unshifted layout (`shift_label=false`) with otherwise matching
 weighting settings; the shifted layout supervises different slots. Anchor sampling,
 block masks, label bounds, `loss_mask` and DFlash-style exponential depth decay are
 reused; `ce_loss_alpha=1` and `l1_loss_alpha=0` are enforced. Reporting accuracy and per-position loss use the
-corrected logits, while the returned loss applies the DFlash objective weights.
+corrected logits. The trainer reports `mixed_ce` as `train/avg_loss`/`eval/avg_loss`
+(the objective actually used for backward) and exposes `mixed_ce`, `backbone_ce` and
+`corrected_ce` as separate token-pooled component curves.
 
 ## Minimal numerical use
 

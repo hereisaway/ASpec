@@ -11,11 +11,17 @@
 
 import math
 
+import torch
+
 from aspec.models.dflash import DFlashModel
 
 
 class DominoModel(DFlashModel):
     """Block-parallel DFlash objective mixed with a causal correction head."""
+
+    # The retained block backbone must still isolate blocks and hide future
+    # Target features when the CUDA FlexAttention path is unavailable.
+    _materialize_cpu_block_mask = True
 
     def __init__(self, *args, lambda_base=0.0, **kwargs):
         super().__init__(*args, **kwargs)
@@ -131,6 +137,32 @@ class DominoModel(DFlashModel):
         loss_per_token = (
             (1.0 - lambda_base) * corrected_per_token + lambda_base * base_per_token
         )
+        # Keep detached per-token values for the trainer's loss-component curves.
+        self._last_loss_tokens = {
+            "mixed_ce": loss_per_token.detach(),
+            "backbone_ce": base_per_token.detach(),
+            "corrected_ce": corrected_per_token.detach(),
+        }
         # Report the corrected objective's per-position value; accuracy uses the
         # corrected logits as well.
         return loss_per_token, corrected_per_token, corrected_logits
+
+    def _extra_training_loss(
+        self,
+        draft_hidden: torch.Tensor,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        objective_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict]:
+        tokens = getattr(self, "_last_loss_tokens", None)
+        if tokens is None:
+            return logits.new_zeros(()), {}
+        flat_weights = objective_weights.reshape(-1)
+        denominator = flat_weights.sum()
+        components = {}
+        for name, values in tokens.items():
+            numerator = (
+                values.reshape(-1).to(flat_weights.dtype) * flat_weights
+            ).sum()
+            components[name] = (numerator, denominator)
+        return logits.new_zeros(()), components

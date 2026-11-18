@@ -461,13 +461,16 @@ def _plain_dflash_with_domino_backbone(domino):
     }
     plain_draft.load_state_dict(backbone, strict=True)
     plain_draft.embed_tokens.requires_grad_(False)
-    return DFlashModel(
+    plain = DFlashModel(
         plain_draft,
         block_size=domino.block_size,
         num_anchors=domino.num_anchors,
         attention_backend="sdpa",
         loss_decay_gamma=domino.loss_decay_gamma,
     )
+    # Compare the objective on the same block-isolated backbone visibility.
+    plain._materialize_cpu_block_mask = True
+    return plain
 
 
 @pytest.mark.parametrize(
@@ -511,6 +514,45 @@ def test_unshifted_lambda_one_matches_plain_dflash_loss_and_gradients():
     ):
         grad = domino_parameters[name].grad
         assert grad is None or torch.count_nonzero(grad) == 0, name
+
+
+def test_cpu_backbone_blocks_hide_later_target_features():
+    model = make_model()
+    inputs = make_inputs()
+    inputs["injected_anchors"] = torch.tensor([[2, 7]])
+    _, base_hidden = run_and_capture(model, inputs)
+    changed = {key: value.clone() if torch.is_tensor(value) else value
+               for key, value in inputs.items()}
+    # Block 0 (anchor 2) only sees context positions 0..1; later Target
+    # features belong to block 1's context.
+    changed["hidden_states_list"][0, 3:] += 5.0
+    _, moved_hidden = run_and_capture(model, changed)
+    base_blocks = base_hidden.reshape(1, 2, 5, -1)
+    moved_blocks = moved_hidden.reshape(1, 2, 5, -1)
+    torch.testing.assert_close(base_blocks[:, 0], moved_blocks[:, 0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        F.linear(base_blocks[:, 0], inputs["lm_head_weight"]),
+        F.linear(moved_blocks[:, 0], inputs["lm_head_weight"]),
+        rtol=0, atol=0,
+    )
+    assert not torch.equal(base_blocks[:, 1], moved_blocks[:, 1])
+
+
+def test_loss_components_report_mixed_backbone_and_corrected():
+    model = make_model(lambda_base=1.0)
+    result = model(**make_inputs())
+    components = result[5]
+    assert {"mixed_ce", "backbone_ce", "corrected_ce"} <= set(components)
+
+    def mean(pair):
+        return (pair[0] / pair[1]).item()
+
+    mixed = mean(components["mixed_ce"])
+    backbone = mean(components["backbone_ce"])
+    corrected = mean(components["corrected_ce"])
+    assert mixed == pytest.approx(backbone, rel=1e-5, abs=1e-6)
+    assert mixed == pytest.approx(float(result[0].detach()), rel=1e-5, abs=1e-6)
+    assert corrected != pytest.approx(mixed, rel=1e-5, abs=1e-6)
 
 
 def test_correction_ignores_future_block_tokens():

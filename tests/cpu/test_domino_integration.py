@@ -34,6 +34,7 @@ _DRAFT_JSON = _REPO_ROOT / "aspec" / "config" / "domino_qwen3_8b_draft_config.js
 _ILLEGAL_OVERRIDES = [
     ("training.dflash_packing=true", PlanCompileError),
     ("training.draft_context_parallel_size=2", NotImplementedError),
+    ("training.attention_backend=sdpa", PlanCompileError),
     ("training.attention_backend=fa4", PlanCompileError),
     ("training.attention_backend=cudnn_flex_attention", PlanCompileError),
     ("training.compile_model=true", PlanCompileError),
@@ -117,10 +118,29 @@ def test_plan_compiles_with_domino_objective(tmp_path):
     assert objective["correction_head"] == {"emb_dim": 256, "gru_hidden_dim": 1024}
     features = plan["workload"]["features"]
     assert features["aux_hidden_state_layers"] == [1, 9, 17, 25, 33]
+    assert "last_hidden_states" not in features["tensors"]
 
     runtime = _runtime_values(config, _load_draft_descriptor(config))
     assert runtime["draft_algorithm"] == "domino"
     assert runtime["domino_lambda_base"] == 0.3
+
+
+def test_trainer_reports_mixed_component_as_avg_loss(monkeypatch):
+    from aspec.training.dflash_trainer import DFlashTrainer
+
+    monkeypatch.setattr(
+        DFlashTrainer,
+        "_aggregate_metrics",
+        lambda self, *args, **kwargs: {"train/avg_loss": 1.0, "train/mixed_ce": 2.0},
+    )
+    monkeypatch.setattr(
+        DFlashTrainer,
+        "_aggregate_eval_metrics",
+        lambda self, *args, **kwargs: {"eval/avg_loss": 3.0, "eval/mixed_ce": 4.0},
+    )
+    trainer = object.__new__(DominoTrainer)
+    assert DominoTrainer._aggregate_metrics(trainer, [], 0)["train/avg_loss"] == 2.0
+    assert DominoTrainer._aggregate_eval_metrics(trainer, [])["eval/avg_loss"] == 4.0
 
 
 @pytest.mark.parametrize("override, error", _ILLEGAL_OVERRIDES)

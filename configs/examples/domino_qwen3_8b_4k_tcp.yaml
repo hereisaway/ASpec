@@ -1,6 +1,6 @@
 # Supplementary configuration example; see the support matrix for supported workflows.
 # Single-node Domino on a frozen Qwen3-8B Target: one Target GPU plus one Draft GPU,
-# 4K, CP1, no packing, SDPA, Store/TCP transport (no NVLink). The short window
+# 4K, CP1, no packing, FlexAttention, Store/TCP transport (no NVLink). The short window
 # validates the execution path, not convergence, acceptance or decoding quality.
 
 model:
@@ -17,7 +17,7 @@ dataset:
   shuffle_dataset: false
 
 training:
-  attention_backend: sdpa
+  attention_backend: flex_attention
   draft_context_parallel_size: 1
   micro_batch_size: 1
   draft_accumulation_steps: 4
@@ -55,7 +55,7 @@ training:
 
 inference:
   inference_engine_type: sgl
-  store_last_hidden_states: true
+  store_last_hidden_states: false
   target_prefill_memory_optimized: false
   inference_num_gpus: 1
   inference_num_gpus_per_engine: 1

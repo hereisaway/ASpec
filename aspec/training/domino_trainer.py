@@ -14,6 +14,7 @@ class DominoTrainer(DFlashTrainer):
     """Domino-specific trainer; reuses the DFlash optimizer/checkpoint path."""
 
     _draft_config_class = DominoConfig
+    _extra_loss_component_keys = ["mixed_ce", "backbone_ce", "corrected_ce"]
 
     def __init__(self, args: Namespace):
         super().__init__(args)
@@ -49,7 +50,7 @@ class DominoTrainer(DFlashTrainer):
             ),
             anchor_seed=getattr(self.args, "seed", 0),
             anchor_sampling_scope=getattr(self.args, "anchor_sampling_scope", "row"),
-            attention_backend=getattr(self.args, "attention_backend", "sdpa"),
+            attention_backend=getattr(self.args, "attention_backend", "flex_attention"),
             draft_context_parallel_size=getattr(
                 self.args, "draft_context_parallel_size", 1
             ),
@@ -58,3 +59,19 @@ class DominoTrainer(DFlashTrainer):
         # anchor slot. Metric aggregators must drop the same prefix.
         self._anchor_slot_offset = wrapper.prediction_start
         return wrapper
+
+    def _aggregate_metrics(self, all_step_metrics, step, *, grad_norm=None):
+        metrics = super()._aggregate_metrics(
+            all_step_metrics, step, grad_norm=grad_norm
+        )
+        mixed = metrics.get("train/mixed_ce")
+        if mixed is not None:
+            metrics["train/avg_loss"] = mixed
+        return metrics
+
+    def _aggregate_eval_metrics(self, all_step_metrics):
+        metrics = super()._aggregate_eval_metrics(all_step_metrics)
+        mixed = metrics.get("eval/mixed_ce")
+        if mixed is not None:
+            metrics["eval/avg_loss"] = mixed
+        return metrics

@@ -396,9 +396,10 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
                 "Domino block_size must match training.dflash_block_size"
             )
         backend = _select(config, "training.attention_backend")
-        if backend != "sdpa":
+        if backend != "flex_attention":
             raise PlanCompileError(
-                "Domino currently supports training.attention_backend=sdpa"
+                "Domino requires training.attention_backend=flex_attention; "
+                "that is the masked block-attention path the CUDA dispatcher uses"
             )
         if _select(config, "training.draft_context_parallel_size", 1) != 1:
             raise PlanCompileError("Domino currently supports draft_context_parallel_size=1")
