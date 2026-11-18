@@ -34,7 +34,7 @@ class DominoTrainer(DFlashTrainer):
         return DominoDraftModel(config)
 
     def _build_training_wrapper(self, draft_model):
-        return DominoModel(
+        wrapper = DominoModel(
             draft_model=draft_model,
             block_size=self.block_size,
             num_anchors=self.num_anchors,
@@ -54,3 +54,7 @@ class DominoTrainer(DFlashTrainer):
                 self.args, "draft_context_parallel_size", 1
             ),
         )
+        # Shifted labels supervise block position 0; unshifted labels skip the
+        # anchor slot. Metric aggregators must drop the same prefix.
+        self._anchor_slot_offset = wrapper.prediction_start
+        return wrapper

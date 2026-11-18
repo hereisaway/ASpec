@@ -166,6 +166,15 @@ def test_trainer_builds_domino_wrapper_and_pins_block_size():
     assert isinstance(wrapper, DominoModel)
     assert wrapper.lambda_base == 0.3
     assert wrapper.block_size == 5
+    assert trainer._anchor_slot_offset == 0
+
+    unshifted = object.__new__(DominoTrainer)
+    unshifted.__dict__.update(trainer.__dict__)
+    unshifted_wrapper = unshifted._build_training_wrapper(
+        DominoDraftModel(_tiny_config(shift_label=False, pure_draft_prefix_len=0))
+    )
+    assert unshifted_wrapper.prediction_start == 1
+    assert unshifted._anchor_slot_offset == 1
 
     trainer.block_size = 4
     with pytest.raises(ValueError):

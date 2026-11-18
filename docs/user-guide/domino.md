@@ -33,8 +33,17 @@ RAY_ADDRESS=local aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
   model.target_model_path=/path/to/Qwen3-8B
 ```
 
-Resume with the same command plus `--resume` and the checkpoint directory. The
-example uses the bundled conversations and a short step budget; it validates the
+For exact recovery, point at a complete checkpoint with `training.load_path` and
+write to a fresh `output_dir`; keep `training.continual_training=false` (the default):
+
+```bash
+aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B \
+  training.load_path=outputs/domino_qwen3_8b_4k_tcp/checkpoints \
+  training.continual_training=false output_dir=outputs/domino_qwen3_8b_4k_tcp_resumed
+```
+
+The example uses the bundled conversations and a short step budget; it validates the
 execution path, not convergence, throughput or decoding acceptance. Supply licensed
 data and a full learning-rate horizon for a real run.
 
