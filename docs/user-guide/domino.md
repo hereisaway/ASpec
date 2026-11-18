@@ -6,7 +6,7 @@ This implements [ASpec #38](https://github.com/inclusionAI/ASpec/issues/38) thro
 GRU-conditioned causal correction head. The ASpec training CLI now selects this
 algorithm through `aspec/config/domino_qwen3_8b_draft_config.json`; the
 [example workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) runs one
-Target GPU plus one Draft GPU at 4K.
+Target GPU plus two Draft GPUs at 4K (three GPUs total).
 
 ## Training selection
 
@@ -44,9 +44,11 @@ aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
   training.continual_training=false output_dir=outputs/domino_qwen3_8b_4k_tcp_resumed
 ```
 
-The example uses the bundled conversations and a short step budget; it validates the
-execution path, not convergence, throughput or decoding acceptance. Supply licensed
-data and a full learning-rate horizon for a real run.
+The example is a short functional smoke-test recipe, not evidence that GPU execution
+has been validated. Only CPU and Plan checks have been reported; the GPU run remains
+pending. It uses the bundled conversations and a short step budget, not convergence,
+throughput or decoding acceptance. Supply licensed data and a full learning-rate
+horizon for a real run.
 
 ## Validation status
 

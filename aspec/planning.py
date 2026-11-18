@@ -405,7 +405,8 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
             raise PlanCompileError("Domino currently supports draft_context_parallel_size=1")
         if _select(config, "training.dflash_packing", False):
             raise PlanCompileError(
-                "Domino rejects padded-only inputs; sequence packing is not implemented"
+                "Domino does not support sequence packing; set "
+                "training.dflash_packing=false"
             )
         if _select(config, "training.compile_model", False):
             raise PlanCompileError("Domino whole-model compile has not been enabled")
@@ -2090,6 +2091,7 @@ def compile_execution_plan(
         or draft["attention"]["csa"] is not None
         or draft["attention"]["qsa"] is not None
         or draft["attention"].get("dsa") is not None
+        or draft["family"] == "domino"
     )
     direct_target_output = bool(
         _select(config, "inference.target_prefill_memory_optimized", False)

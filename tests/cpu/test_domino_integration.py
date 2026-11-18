@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from aspec.config.draft_algorithm import draft_model_semantics, resolve_draft_algorithm
 from aspec.config.train_config import load_config
@@ -119,28 +120,65 @@ def test_plan_compiles_with_domino_objective(tmp_path):
     features = plan["workload"]["features"]
     assert features["aux_hidden_state_layers"] == [1, 9, 17, 25, 33]
     assert "last_hidden_states" not in features["tensors"]
+    attention = next(
+        item for item in plan["capabilities"] if item["name"] == "draft_attention_execution"
+    )
+    assert attention["requirement"] == "required"
+    assert attention["effective_state"] != "omitted"
 
     runtime = _runtime_values(config, _load_draft_descriptor(config))
     assert runtime["draft_algorithm"] == "domino"
     assert runtime["domino_lambda_base"] == 0.3
 
 
-def test_trainer_reports_mixed_component_as_avg_loss(monkeypatch):
-    from aspec.training.dflash_trainer import DFlashTrainer
+def test_trainer_aggregates_real_mixed_component(monkeypatch):
+    import aspec.training.dflash_trainer as trainer_module
 
-    monkeypatch.setattr(
-        DFlashTrainer,
-        "_aggregate_metrics",
-        lambda self, *args, **kwargs: {"train/avg_loss": 1.0, "train/mixed_ce": 2.0},
-    )
-    monkeypatch.setattr(
-        DFlashTrainer,
-        "_aggregate_eval_metrics",
-        lambda self, *args, **kwargs: {"eval/avg_loss": 3.0, "eval/mixed_ce": 4.0},
-    )
+    monkeypatch.setattr(trainer_module.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer_module.dist, "get_rank", lambda: 1)
     trainer = object.__new__(DominoTrainer)
-    assert DominoTrainer._aggregate_metrics(trainer, [], 0)["train/avg_loss"] == 2.0
-    assert DominoTrainer._aggregate_eval_metrics(trainer, [])["eval/avg_loss"] == 4.0
+    trainer._anchor_slot_offset = 0
+    trainer.global_step = 0
+    trainer.optimizer = SimpleNamespace(get_learning_rate=lambda: 0.0)
+    trainer.dflash = SimpleNamespace(mtp_conditioning=None)
+    trainer.draft_model = SimpleNamespace(config=SimpleNamespace())
+    trainer.loss_decay_gamma = 0.0
+
+    train_metrics = [
+        {
+            "loss_per_position": torch.tensor([1.0]),
+            "acc_per_position": torch.tensor([1.0]),
+            "count_per_position": torch.tensor([1.0]),
+            "mixed_ce": (torch.tensor(2.0), torch.tensor(1.0)),
+        },
+        {
+            "loss_per_position": torch.tensor([1.0]),
+            "acc_per_position": torch.tensor([1.0]),
+            "count_per_position": torch.tensor([1.0]),
+            "mixed_ce": (torch.tensor(9.0), torch.tensor(3.0)),
+        },
+    ]
+    metrics = trainer._aggregate_metrics(train_metrics, step=1)
+    assert metrics["train/mixed_ce"] == pytest.approx(11 / 4)
+    assert metrics["train/avg_loss"] == pytest.approx(11 / 4)
+
+    eval_metrics = [
+        {
+            "loss_pp": torch.tensor([1.0]),
+            "acc_pp": torch.tensor([1.0]),
+            "count_pp": torch.tensor([1.0]),
+            "mixed_ce": (torch.tensor(2.0), torch.tensor(1.0)),
+        },
+        {
+            "loss_pp": torch.tensor([1.0]),
+            "acc_pp": torch.tensor([1.0]),
+            "count_pp": torch.tensor([1.0]),
+            "mixed_ce": (torch.tensor(9.0), torch.tensor(3.0)),
+        },
+    ]
+    eval_output = trainer._aggregate_eval_metrics(eval_metrics)
+    assert eval_output["eval/mixed_ce"] == pytest.approx(11 / 4)
+    assert eval_output["eval/avg_loss"] == pytest.approx(11 / 4)
 
 
 @pytest.mark.parametrize("override, error", _ILLEGAL_OVERRIDES)
@@ -199,6 +237,12 @@ def test_trainer_builds_domino_wrapper_and_pins_block_size():
     trainer.block_size = 4
     with pytest.raises(ValueError):
         trainer._build_draft_model(_tiny_config())
+
+
+def test_exact_resume_requires_topology_for_domino():
+    args = _trainer_args()
+    with pytest.raises(RuntimeError, match="training_topology for Domino"):
+        _validate_exact_resume_topology(args, {"world_size": 2})
 
 
 def test_checkpoint_topology_pins_domino_objective():

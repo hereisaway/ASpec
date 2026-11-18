@@ -1,7 +1,7 @@
 # Supplementary configuration example; see the support matrix for supported workflows.
-# Single-node Domino on a frozen Qwen3-8B Target: one Target GPU plus one Draft GPU,
-# 4K, CP1, no packing, FlexAttention, Store/TCP transport (no NVLink). The short window
-# validates the execution path, not convergence, acceptance or decoding quality.
+# Single-node Domino on a frozen Qwen3-8B Target: one Target GPU plus two Draft GPUs,
+# 4K, CP1, no packing, FlexAttention, Store/TCP transport (no NVLink). This is a
+# functional smoke test, not evidence of convergence, acceptance or decoding quality.
 
 model:
   target_model_path: ${oc.env:ASPEC_TARGET_MODEL}

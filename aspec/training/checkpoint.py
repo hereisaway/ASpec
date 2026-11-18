@@ -202,6 +202,11 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
     ):
         raise RuntimeError("Exact resume cannot change a legacy full-attention checkpoint to SWA")
     if saved_topology is None:
+        if getattr(args, "draft_algorithm", None) == "domino":
+            raise RuntimeError(
+                "Exact resume requires training_topology for Domino checkpoints; "
+                "use continual_training=true for a weights-only new stage."
+            )
         # Older complete checkpoints recorded world_size only.  Preserve that
         # compatibility while every newly published checkpoint records the
         # full logical parallelism contract below.
