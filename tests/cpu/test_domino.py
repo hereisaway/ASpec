@@ -79,7 +79,7 @@ def run_and_capture(model, inputs):
     return result, captured[0]
 
 
-def reference_objective(model, draft_hidden, inputs):
+def reference_objective(model, draft_hidden, inputs, *, report="corrected", details=False):
     """Dense Domino equations with explicit label/anchor/mask alignment."""
     draft_model = model.draft_model
     anchors = inputs["injected_anchors"]
@@ -150,8 +150,9 @@ def reference_objective(model, draft_hidden, inputs):
 
     binary = weights.reshape(-1)
     count = binary.reshape(-1, anchors.shape[1], block_size).sum(dim=(0, 1))
+    reported_ce = base_ce if report == "backbone" else corrected_ce
     per_position = (
-        corrected_ce.reshape(-1, anchors.shape[1], block_size) * weights
+        reported_ce.reshape(-1, anchors.shape[1], block_size) * weights
     ).sum(dim=(0, 1)) / count.clamp(min=1.0)
     denominator = flat_weights.sum().clamp_min(1e-6)
     components = {
@@ -159,12 +160,27 @@ def reference_objective(model, draft_hidden, inputs):
         "backbone_ce": ((base_ce * flat_weights).sum(), denominator),
         "corrected_ce": ((corrected_ce * flat_weights).sum(), denominator),
     }
-    return (
+    result = (
         loss,
-        corrected_ce.reshape(-1, anchors.shape[1], block_size),
+        reported_ce.reshape(-1, anchors.shape[1], block_size),
         per_position,
         components,
     )
+    if not details:
+        return result
+    base_pred = base_logits.reshape(-1, 32).argmax(-1)
+    base_correct = (base_pred == target_ids.reshape(-1)) & (binary > 0.5)
+    details_value = {
+        "backbone_per_position": (
+            base_ce.reshape(-1, anchors.shape[1], block_size) * weights
+        ).sum(dim=(0, 1)) / count.clamp(min=1.0),
+        "backbone_acc_per_position": (
+            base_correct.reshape(-1, anchors.shape[1], block_size).float().sum(dim=(0, 1))
+            / count.clamp(min=1.0)
+        ),
+        "count_per_position": count,
+    }
+    return (*result, details_value)
 
 
 def _assert_parameter_gradients(actual, expected):
@@ -282,6 +298,59 @@ def test_lambda_one_recovers_the_backbone_only_objective():
     ):
         assert parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
     assert torch.count_nonzero(model.draft_model.context_proj.weight.grad) > 0
+
+
+def test_same_forward_backbone_metrics_share_the_anchor_slot():
+    model = make_model(lambda_base=0.3, loss_decay_gamma=0.0)
+    inputs = make_inputs(length=20)
+    # Exercise anchor sampling rather than injected anchors.
+    inputs.pop("injected_anchors")
+    inputs.pop("injected_keep_mask")
+    model.collect_extra_position_metrics = True
+    result, _ = run_and_capture(model, inputs)
+    extra = model._last_extra_position_metrics
+    assert extra["backbone_loss_pp"].shape == result[2].shape
+    # The shifted layout keeps backbone logits at position 0, so both branches
+    # must score the same anchor with the same sampled anchors and weights.
+    torch.testing.assert_close(
+        result[2][0], extra["backbone_loss_pp"][0], rtol=1e-6, atol=1e-6
+    )
+    torch.testing.assert_close(
+        result[3][0], extra["backbone_acc_pp"][0], rtol=1e-6, atol=1e-6
+    )
+
+
+def test_extra_position_metrics_match_reference_with_masked_position():
+    model = make_model(lambda_base=0.3, loss_decay_gamma=0.0)
+    inputs = make_inputs()
+    inputs["loss_mask"][0, 9] = 0
+    model.collect_extra_position_metrics = True
+    result, captured = run_and_capture(model, inputs)
+    extra = model._last_extra_position_metrics
+    expected = reference_objective(
+        model, captured, inputs, report="backbone", details=True
+    )[4]
+    torch.testing.assert_close(
+        extra["backbone_loss_pp"],
+        expected["backbone_per_position"],
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    torch.testing.assert_close(
+        extra["backbone_acc_pp"],
+        expected["backbone_acc_per_position"],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        extra["backbone_count_pp"], expected["count_per_position"], rtol=0, atol=0
+    )
+    assert not torch.equal(result[2], expected["backbone_per_position"])
+    assert (expected["count_per_position"] < expected["count_per_position"].max()).any()
+    torch.testing.assert_close(
+        result[2][0], extra["backbone_loss_pp"][0], rtol=1e-6, atol=1e-6
+    )
+    assert model._last_backbone_report is None
 
 
 def test_two_row_layout_matches_reference_and_backward():

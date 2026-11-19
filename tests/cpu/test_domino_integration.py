@@ -25,6 +25,7 @@ from aspec.training.checkpoint import (
     _logical_training_topology,
     _validate_exact_resume_topology,
 )
+from aspec.training.dflash_trainer import DFlashTrainer
 from aspec.training.domino_trainer import DominoTrainer
 from aspec.training.trainer_actor import _trainer_class_for_config
 
@@ -181,6 +182,113 @@ def test_trainer_aggregates_real_mixed_component(monkeypatch):
     assert eval_output["eval/avg_loss"] == pytest.approx(11 / 4)
 
 
+def test_plan_compiles_with_domino_lambda_curriculum(tmp_path):
+    config, args = _config(
+        tmp_path,
+        "training.domino_lambda_base_start=1.0",
+        "training.domino_lambda_base_decay_ratio=1.0",
+        "training.domino_eval_backbone=true",
+    )
+    plan = compile_execution_plan(
+        config, config_path=str(_EXAMPLE), cli_args=args
+    ).to_dict()
+    objective = plan["workload"]["objective"]
+    assert objective["lambda_base_start"] == 1.0
+    assert objective["lambda_base_decay_ratio"] == 1.0
+    assert objective["eval_backbone"] is True
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        ("training.domino_lambda_base_start=1.0",),
+        ("training.domino_lambda_base_decay_ratio=1.0",),
+        (
+            "training.domino_lambda_base_start=2.0",
+            "training.domino_lambda_base_decay_ratio=1.0",
+        ),
+        (
+            "training.domino_lambda_base_start=1.0",
+            "training.domino_lambda_base_decay_ratio=0.0",
+        ),
+    ],
+)
+def test_plan_rejects_invalid_domino_lambda_curriculum(tmp_path, overrides):
+    config, args = _config(tmp_path, *overrides)
+    with pytest.raises(PlanCompileError):
+        compile_execution_plan(config, config_path=str(_EXAMPLE), cli_args=args)
+
+
+def test_lambda_curriculum_matches_reference_microbatch_counter():
+    trainer = object.__new__(DominoTrainer)
+    trainer.lambda_base = 0.3
+    trainer.lambda_base_start = 1.0
+    trainer.lambda_base_decay_ratio = 1.0
+    trainer.lambda_total_steps = 8
+    assert trainer._lambda_base_for_micro_step(1) == pytest.approx(0.875)
+    assert trainer._lambda_base_for_micro_step(2) == pytest.approx(0.75)
+    assert trainer._lambda_base_for_micro_step(4) == pytest.approx(0.5)
+    assert trainer._lambda_base_for_micro_step(8) == pytest.approx(0.0)
+    assert trainer._lambda_base_for_micro_step(99) == pytest.approx(0.0)
+
+    trainer.lambda_base_start = None
+    trainer.lambda_base_decay_ratio = None
+    assert trainer._lambda_base_for_micro_step(4) == pytest.approx(0.3)
+
+
+def test_training_loop_advances_lambda_per_microbatch(monkeypatch):
+    trainer = object.__new__(DominoTrainer)
+    trainer.global_step = 0
+    trainer.lambda_base = 0.3
+    trainer.lambda_base_start = 1.0
+    trainer.lambda_base_decay_ratio = 1.0
+    trainer.lambda_total_steps = 8
+    trainer.args = SimpleNamespace(draft_accumulation_steps=2)
+    captured = []
+    trainer.dflash = SimpleNamespace(set_lambda_base=captured.append)
+    monkeypatch.setattr(DFlashTrainer, "_train_step", lambda self, **kwargs: {})
+
+    trainer._train_step(
+        batch=None, accumulation_steps=2, step=1, batch_idx=0, num_batches=2
+    )
+    trainer._train_step(
+        batch=None, accumulation_steps=2, step=1, batch_idx=1, num_batches=2
+    )
+    assert captured == pytest.approx([0.875, 0.75])
+
+
+def test_backbone_eval_metrics_aggregate_per_position(monkeypatch):
+    import aspec.training.dflash_trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer_module.dist, "get_rank", lambda: 1)
+    trainer = object.__new__(DominoTrainer)
+    trainer._anchor_slot_offset = 0
+    trainer.global_step = 4
+    trainer.optimizer = SimpleNamespace(get_learning_rate=lambda: 0.0)
+    trainer.dflash = SimpleNamespace(
+        mtp_conditioning=None, collect_extra_position_metrics=False
+    )
+    trainer.draft_model = SimpleNamespace(config=SimpleNamespace())
+    trainer.loss_decay_gamma = 0.0
+    trainer.args = SimpleNamespace(draft_accumulation_steps=2)
+    step = {
+        "loss_pp": torch.tensor([1.0]),
+        "acc_pp": torch.tensor([1.0]),
+        "count_pp": torch.tensor([1.0]),
+        "backbone_loss_pp": torch.tensor([2.0]),
+        "backbone_acc_pp": torch.tensor([0.5]),
+        "backbone_count_pp": torch.tensor([1.0]),
+        "mixed_ce": (torch.tensor(2.0), torch.tensor(1.0)),
+    }
+    metrics = trainer._aggregate_eval_metrics([step])
+    assert metrics["eval/backbone_ploss_0"] == pytest.approx(2.0)
+    assert metrics["eval/backbone_acc_0"] == pytest.approx(0.5)
+    assert metrics["eval/backbone_avg_loss"] == pytest.approx(2.0)
+    assert metrics["eval/backbone_avg_acc"] == pytest.approx(0.5)
+    assert metrics["eval/backbone_simulated_acc_len"] == pytest.approx(0.5)
+
+
 def test_plan_rejects_explicit_cudnn_gqa_mode(tmp_path):
     raw = json.loads(_DRAFT_JSON.read_text(encoding="utf-8"))
     raw["cudnn_gqa_mode"] = "native"
@@ -208,7 +316,9 @@ def _trainer_args():
         dflash_block_size=5, dflash_num_anchors=2, dflash_num_target_layers=1,
         dflash_loss_objective="decay", dflash_dpace_alpha=0.5,
         dflash_loss_decay_gamma=7.0, dflash_ce_loss_alpha=1.0, dflash_l1_loss_alpha=0.0,
-        domino_lambda_base=0.3, anchor_sampling_scope="row",
+        domino_lambda_base=0.3, domino_lambda_base_start=None,
+        domino_lambda_base_decay_ratio=None, domino_eval_backbone=False,
+        anchor_sampling_scope="row", lr_total_steps=8, num_train_steps=8,
         deterministic_anchor_sampling=False, max_seq_length=128, micro_batch_size=1,
         draft_accumulation_steps=1, max_grad_norm=1.0, seed=42,
         draft_context_parallel_size=1, training_num_nodes=1, training_num_gpus_per_node=2,
@@ -291,3 +401,49 @@ def test_checkpoint_topology_pins_domino_objective():
     changed["training_topology"]["training_objective"]["lambda_base"] = 0.5
     with pytest.raises(RuntimeError):
         _validate_exact_resume_topology(args, changed)
+
+
+def test_exact_resume_rejects_adding_curriculum_to_legacy_checkpoint():
+    args = _trainer_args()
+    legacy = _logical_training_topology(args, 2)
+    legacy["training_objective"].pop("lambda_base_start", None)
+    legacy["training_objective"].pop("lambda_base_decay_ratio", None)
+    metadata = {"world_size": 2, "training_topology": json.loads(json.dumps(legacy))}
+    _validate_exact_resume_topology(args, metadata)
+
+    args.domino_lambda_base_start = 1.0
+    args.domino_lambda_base_decay_ratio = 1.0
+    with pytest.raises(RuntimeError, match="lambda_base curriculum"):
+        _validate_exact_resume_topology(args, metadata)
+
+
+def test_checkpoint_topology_pins_domino_lambda_curriculum():
+    args = _trainer_args()
+    args.domino_lambda_base_start = 1.0
+    args.domino_lambda_base_decay_ratio = 1.0
+    current = _logical_training_topology(args, 2)
+    objective = current["training_objective"]
+    assert objective["lambda_base_start"] == 1.0
+    assert objective["lambda_base_decay_ratio"] == 1.0
+    assert objective["lambda_base_total_steps"] == 8
+
+    metadata = {"world_size": 2, "training_topology": json.loads(json.dumps(current))}
+    _validate_exact_resume_topology(args, metadata)
+    changed = json.loads(json.dumps(metadata))
+    changed["training_topology"]["training_objective"][
+        "lambda_base_decay_ratio"
+    ] = 0.5
+    with pytest.raises(RuntimeError):
+        _validate_exact_resume_topology(args, changed)
+
+    args.lr_total_steps = 16
+    with pytest.raises(RuntimeError, match="lambda_base_total_steps"):
+        _validate_exact_resume_topology(args, metadata)
+
+    missing_horizon = json.loads(json.dumps(metadata))
+    del missing_horizon["training_topology"]["training_objective"][
+        "lambda_base_total_steps"
+    ]
+    args.lr_total_steps = 8
+    with pytest.raises(RuntimeError, match="lambda_base_total_steps"):
+        _validate_exact_resume_topology(args, missing_horizon)

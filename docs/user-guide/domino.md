@@ -4,19 +4,26 @@ This implements [ASpec #38](https://github.com/inclusionAI/ASpec/issues/38) thro
 `aspec.models.draft.domino.DominoDraftModel` and
 `aspec.models.domino.DominoModel`: a block-parallel DFlash backbone with a
 GRU-conditioned causal correction head. The ASpec training CLI now selects this
-algorithm through `aspec/config/domino_qwen3_8b_draft_config.json`; the
-[example workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) runs one
-Target GPU plus two Draft GPUs at 4K (three GPUs total).
+algorithm through `aspec/config/domino_qwen3_8b_draft_config.json`. The
+[supplementary held-out example](../../configs/examples/domino_qwen3_8b_eval.yaml)
+and the [smoke workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) both run
+one Target GPU plus two Draft GPUs at 4K (three GPUs total).
 
 ## Training selection
 
 - Draft config: `aspec/config/domino_qwen3_8b_draft_config.json` (Qwen3-8B,
   `block_size=16`, `shift_label=true`, `pure_draft_prefix_len=1`).
-- Example: `configs/examples/domino_qwen3_8b_4k_tcp.yaml` (FlexAttention, CP1, MBS1,
-  non-packing, REPLICATE, Store/TCP transport).
-- The trainer owns a fixed per-run `training.domino_lambda_base`; the curriculum
-  schedule is not implemented yet. Exact recovery records `lambda_base`, the label
-  layout and the correction-head dimensions.
+- Held-out example: `configs/examples/domino_qwen3_8b_eval.yaml` (FlexAttention,
+  CP1, non-packing, REPLICATE, Store/TCP transport, held-out eval and the linear
+  `lambda_base` curriculum). Catalog promotion waits for native export/strict
+  reload validation; `domino_qwen3_8b_4k_tcp.yaml` remains a shorter smoke test.
+- `training.domino_lambda_base` is the constant fallback. Set both
+  `training.domino_lambda_base_start` and `training.domino_lambda_base_decay_ratio`
+  to apply the reference linear schedule. Exact recovery records the constant,
+  schedule, effective curriculum horizon, label layout and correction-head
+  dimensions.
+- Set `dataset.eval_data_path` and `training.domino_eval_backbone=true` to report
+  held-out corrected and backbone-only observations per prediction position.
 - The supported path fails closed outside dense full attention, padded inputs,
   `attention_backend=flex_attention`, `draft_context_parallel_size=1` and
   `dflash_packing=false`. The CUDA FlexAttention mask and the CPU dense fallback
@@ -34,7 +41,9 @@ CUDA_VISIBLE_DEVICES=0 aspec target \
   model.target_model_path=/path/to/Qwen3-8B
 ```
 
-Compile the example, then train with two Draft GPUs (GPUs 1 and 2):
+For held-out data and the curriculum, set `ASPEC_TRAIN_DATA` and `ASPEC_EVAL_DATA`
+and use `configs/examples/domino_qwen3_8b_eval.yaml`. Compile the smoke example,
+then train with two Draft GPUs (GPUs 1 and 2):
 
 ```bash
 aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml --dry-run \
@@ -63,18 +72,18 @@ CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
   output_dir=outputs/domino_qwen3_8b_4k_tcp_resumed
 ```
 
-The example is a short functional smoke-test recipe, not evidence that GPU execution
-has been validated. Only CPU and Plan checks have been reported; the GPU run remains
-pending. It uses the bundled conversations and a short step budget, not convergence,
-throughput or decoding acceptance. Supply licensed data and a full learning-rate
-horizon for a real run.
+The example is a short functional smoke test, not convergence, throughput or
+decoding-acceptance evidence. A GPU run with one Target plus two Draft GPUs has been
+reported for training and exact resume; it does not establish model quality. Supply
+licensed data, a full learning-rate horizon and the recipe for a real run.
 
 ## Validation status
 
 Plan compilation, registration, trainer construction, checkpoint topology and the
-CPU numerical contracts are covered by `tests/cpu`. The public CI lane is CPU-only;
-GPU end-to-end training and exact resume still need a hardware run before claiming
-throughput or quality.
+CPU numerical contracts are covered by `tests/cpu`. A GPU run with one Target and two
+Draft GPUs verified 8-step training and step-4 exact resume: losses, model tensors,
+optimizer state and RNG state matched the uninterrupted run. The public CI lane is
+CPU-only; no throughput, quality or decoding-acceptance claim is made here.
 
 ## Reference and selected scope
 
@@ -135,8 +144,14 @@ loss = (1 - lambda_base) * CE(corrected logits, labels)
      + lambda_base     * CE(backbone logits, labels)
 ```
 
-`lambda_base` is an explicit per-step value in `[0, 1]`; use
-`model.set_lambda_base(value)` from a trainer-owned curriculum. `lambda_base=1`
+With both curriculum fields set, the trainer evaluates the value at the 1-based
+microbatch counter `m`:
+`start * max(0, 1 - m / max(1, int(lr_total_steps * decay_ratio)))`.
+`lr_total_steps` is measured in optimizer updates; because the counter advances per
+microbatch, accumulation greater than one reaches zero before the last update,
+matching the reference SpecForge Domino trainer. Otherwise the value stays at
+`domino_lambda_base`.
+`lambda_base=1`
 removes the correction contribution and keeps the selected label layout (the
 correction head receives no useful gradient). It equals the plain DFlash objective
 only for the unshifted layout (`shift_label=false`) with otherwise matching
@@ -145,7 +160,15 @@ block masks, label bounds, `loss_mask` and DFlash-style exponential depth decay 
 reused; `ce_loss_alpha=1` and `l1_loss_alpha=0` are enforced. Reporting accuracy and per-position loss use the
 corrected logits. The trainer reports `mixed_ce` as `train/avg_loss`/`eval/avg_loss`
 (the objective actually used for backward) and exposes `mixed_ce`, `backbone_ce` and
-`corrected_ce` as separate token-pooled component curves.
+`corrected_ce` as separate token-pooled component curves. With
+`training.domino_eval_backbone=true`, the same evaluation forward and the same
+sampled anchors produce both branches:
+`eval/ploss_i`/`eval/acc_i` remain corrected, while
+`eval/backbone_ploss_i`/`eval/backbone_acc_i` (plus
+`eval/backbone_avg_loss`, `eval/backbone_avg_acc` and
+`eval/backbone_simulated_acc_len`) describe the backbone-only branch. There is no
+second evaluation pass, and the mixed objective and trained correction head are
+unchanged by this reporting mode.
 
 ## Minimal numerical use
 
@@ -189,7 +212,8 @@ handling, empty supervision, and frozen Target/embedding behavior.
 
 ## Remaining work
 
-The `lambda_base` curriculum schedule, a maintained recipe catalog entry, native
-export with strict reloading, Target bindings, proposal consumers and held-out
-backbone-vs-corrected observations remain pending. CPU numerical and Plan checks do
-not establish Qwen3-8B training quality, GPU throughput or decoding acceptance.
+Native export with strict reloading, Target bindings, proposal consumers and
+acceptance observations remain pending. Recipe catalog promotion also waits for the
+native export/strict reload check. The next planned increment is the aligned
+SpecForge-vs-ASpec comparison. CPU numerical and Plan checks do not establish
+Qwen3-8B training quality, GPU throughput or decoding acceptance.
