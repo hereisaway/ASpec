@@ -18,6 +18,9 @@ short unusable rows are excluded and counted. DSpark block 7 needs at least 14 s
 Use disjoint train/eval data and preserve identity across resume. Evidence distinguishes raw, processed,
 admitted, skipped and DP-truncated counts. Epoch-scoped work count is not unique-document count.
 
+Dataset tokenization uses the top-level `num_proc` worker count (default 64). Set
+`num_proc: 1` on hosts where fork-based multiprocessing is constrained or hangs.
+
 ## Target-generated data
 
 The Qwen3-8B quality recipe generates answers from the actual Target, saving exact non-thinking prompt

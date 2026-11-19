@@ -48,6 +48,9 @@ class DominoModel(DFlashModel):
         # anchor slot. Both match the two documented Domino layouts.
         self.label_start = 1 if self.draft_model.shift_label else 0
         self.prediction_start = 1 - self.label_start
+        # Held-out evaluation can report the backbone-only branch without
+        # changing the mixed objective used for training.
+        self.report_backbone = False
         self.set_lambda_base(lambda_base)
 
     def _prepare_draft_prefix(
@@ -143,8 +146,11 @@ class DominoModel(DFlashModel):
             "backbone_ce": base_per_token.detach(),
             "corrected_ce": corrected_per_token.detach(),
         }
-        # Report the corrected objective's per-position value; accuracy uses the
-        # corrected logits as well.
+        # Report the corrected objective's per-position value by default;
+        # accuracy uses the corrected logits as well. Held-out backbone-only
+        # evaluation flips the reporting branch without changing the mixed loss.
+        if self.report_backbone:
+            return loss_per_token, base_per_token, base_logits
         return loss_per_token, corrected_per_token, corrected_logits
 
     def _extra_training_loss(

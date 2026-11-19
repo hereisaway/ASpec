@@ -17,6 +17,7 @@ connections on your hardware before training.
 | `quickstart` | Qwen3-8B / DSpark | 1 node, 2 GPUs: 1T + 1D; 1K | Try training, recovery and export with bundled data |
 | `dspark` | Qwen3-8B / Dense DSpark | 1 node, 8 GPUs: 4T + 4D; 4K | Train on your data with packing and NVLink |
 | `dflash` | Qwen3-8B / DFlash | 1 node, 3 GPUs: 1T + 2D; 4K | Train a block-parallel DFlash Draft |
+| `domino` | Qwen3-8B / Domino | 1 node, 3 GPUs: 1T + 2D; 4K | Train a DFlash backbone with a GRU causal correction head |
 | `eagle3` | Qwen3-8B / EAGLE3 | 1 node, 3 GPUs: 1T + 2D; 4K | Train a recurrent EAGLE3 Draft |
 | `eagle4` | Qwen3-8B / EAGLE4 | 1 node, 3 GPUs: 1T + 2D; 4K; sequential stages | Train a Draft, then candidate retrieval projections |
 | `dmtp` | Qwen3.5-9B / MTP-conditioned DSpark | 1 node, 8 GPUs: 4T + 4D; 4K, CP1 | Train a Draft conditioned on the frozen native predictor; native assets |

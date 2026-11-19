@@ -240,6 +240,13 @@ class TrainingConfig:
     # Domino mixes corrected and backbone-only CE as
     # (1 - lambda_base) * corrected + lambda_base * backbone.
     domino_lambda_base: float = 0.3
+    # Optional linear curriculum for lambda_base, mirroring the reference
+    # SpecForge schedule: start * max(0, 1 - step / (total_steps * ratio)).
+    # Leave both unset to keep the constant domino_lambda_base value.
+    domino_lambda_base_start: Optional[float] = None
+    domino_lambda_base_decay_ratio: Optional[float] = None
+    # Report backbone-only per-position held-out metrics alongside corrected.
+    domino_eval_backbone: bool = False
     # Pack multiple complete documents into one fixed row. The controller owns
     # grouping; the trainer preserves document boundaries for attention/RoPE.
     dflash_packing: bool = False
@@ -300,6 +307,9 @@ class Config:
     mooncake: dict[str, Any] = field(default_factory=dict)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     cache_dir: str = "./cache"
+    # Tokenizer worker processes for dataset preparation. Lower this on hosts
+    # where fork-based multiprocessing is constrained.
+    num_proc: int = 64
     cache_key: Optional[str] = None
     model_download_dir: Optional[str] = None
     output_dir: str = ""
@@ -367,6 +377,9 @@ def _validate_vllm_config(config: DictConfig) -> None:
 
 def _validate_current_scope(config: DictConfig) -> None:
     """Reject backend selections outside ASpec's current executable path."""
+    num_proc = config.get("num_proc", 64)
+    if isinstance(num_proc, bool) or not isinstance(num_proc, int) or num_proc < 1:
+        raise ValueError("num_proc must be an integer >= 1")
     engine_type = config.inference.inference_engine_type
     target_backend = config.model.target_model_backend
     if engine_type not in {"sgl", "offline"} or target_backend != "sglang":

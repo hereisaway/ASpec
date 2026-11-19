@@ -427,6 +427,30 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
         if (isinstance(lambda_base, bool) or not isinstance(lambda_base, (int, float))
                 or not math.isfinite(lambda_base) or not 0.0 <= lambda_base <= 1.0):
             raise PlanCompileError("domino_lambda_base must be a finite number in [0, 1]")
+        lambda_start = _select(config, "training.domino_lambda_base_start", None)
+        lambda_ratio = _select(config, "training.domino_lambda_base_decay_ratio", None)
+        if (lambda_start is None) != (lambda_ratio is None):
+            raise PlanCompileError(
+                "domino_lambda_base_start and domino_lambda_base_decay_ratio "
+                "must be set together"
+            )
+        if lambda_start is not None:
+            if (isinstance(lambda_start, bool)
+                    or not isinstance(lambda_start, (int, float))
+                    or not math.isfinite(lambda_start)
+                    or not 0.0 <= lambda_start <= 1.0):
+                raise PlanCompileError(
+                    "domino_lambda_base_start must be a finite number in [0, 1]"
+                )
+            if (isinstance(lambda_ratio, bool)
+                    or not isinstance(lambda_ratio, (int, float))
+                    or not math.isfinite(lambda_ratio)
+                    or lambda_ratio <= 0.0):
+                raise PlanCompileError(
+                    "domino_lambda_base_decay_ratio must be a finite number > 0"
+                )
+        if not isinstance(_select(config, "training.domino_eval_backbone", False), bool):
+            raise PlanCompileError("domino_eval_backbone must be boolean")
 
     target_layer_ids = raw.get("target_layer_ids")
     if not isinstance(target_layer_ids, list) or not target_layer_ids:
@@ -1442,6 +1466,13 @@ def _workload(
             "ce_loss_alpha": 1.0,
             "l1_loss_alpha": 0.0,
             "lambda_base": _select(config, "training.domino_lambda_base", 0.3),
+            "lambda_base_start": _select(
+                config, "training.domino_lambda_base_start", None
+            ),
+            "lambda_base_decay_ratio": _select(
+                config, "training.domino_lambda_base_decay_ratio", None
+            ),
+            "eval_backbone": _select(config, "training.domino_eval_backbone", False),
             "shift_label": draft["domino_shift_label"],
             "pure_draft_prefix_len": draft["domino_pure_draft_prefix_len"],
             "correction_head": {

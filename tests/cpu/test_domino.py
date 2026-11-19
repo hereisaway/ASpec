@@ -79,7 +79,7 @@ def run_and_capture(model, inputs):
     return result, captured[0]
 
 
-def reference_objective(model, draft_hidden, inputs):
+def reference_objective(model, draft_hidden, inputs, *, report="corrected"):
     """Dense Domino equations with explicit label/anchor/mask alignment."""
     draft_model = model.draft_model
     anchors = inputs["injected_anchors"]
@@ -150,8 +150,9 @@ def reference_objective(model, draft_hidden, inputs):
 
     binary = weights.reshape(-1)
     count = binary.reshape(-1, anchors.shape[1], block_size).sum(dim=(0, 1))
+    reported_ce = base_ce if report == "backbone" else corrected_ce
     per_position = (
-        corrected_ce.reshape(-1, anchors.shape[1], block_size) * weights
+        reported_ce.reshape(-1, anchors.shape[1], block_size) * weights
     ).sum(dim=(0, 1)) / count.clamp(min=1.0)
     denominator = flat_weights.sum().clamp_min(1e-6)
     components = {
@@ -161,7 +162,7 @@ def reference_objective(model, draft_hidden, inputs):
     }
     return (
         loss,
-        corrected_ce.reshape(-1, anchors.shape[1], block_size),
+        reported_ce.reshape(-1, anchors.shape[1], block_size),
         per_position,
         components,
     )
@@ -282,6 +283,23 @@ def test_lambda_one_recovers_the_backbone_only_objective():
     ):
         assert parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
     assert torch.count_nonzero(model.draft_model.context_proj.weight.grad) > 0
+
+
+def test_backbone_reporting_switches_per_position_metrics_only():
+    model = make_model(lambda_base=0.3, loss_decay_gamma=0.0)
+    inputs = make_inputs()
+    corrected, captured = run_and_capture(model, inputs)
+    model.report_backbone = True
+    backbone, _ = run_and_capture(model, inputs)
+    expected_loss, _, expected_per_position, _ = reference_objective(
+        model, captured, inputs, report="backbone"
+    )
+    torch.testing.assert_close(backbone[0], corrected[0])
+    torch.testing.assert_close(backbone[0], expected_loss, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(
+        backbone[2], expected_per_position, rtol=2e-5, atol=2e-6
+    )
+    assert not torch.equal(corrected[2], backbone[2])
 
 
 def test_two_row_layout_matches_reference_and_backward():

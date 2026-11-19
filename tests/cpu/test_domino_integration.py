@@ -181,6 +181,88 @@ def test_trainer_aggregates_real_mixed_component(monkeypatch):
     assert eval_output["eval/avg_loss"] == pytest.approx(11 / 4)
 
 
+def test_plan_compiles_with_domino_lambda_curriculum(tmp_path):
+    config, args = _config(
+        tmp_path,
+        "training.domino_lambda_base_start=1.0",
+        "training.domino_lambda_base_decay_ratio=1.0",
+        "training.domino_eval_backbone=true",
+    )
+    plan = compile_execution_plan(
+        config, config_path=str(_EXAMPLE), cli_args=args
+    ).to_dict()
+    objective = plan["workload"]["objective"]
+    assert objective["lambda_base_start"] == 1.0
+    assert objective["lambda_base_decay_ratio"] == 1.0
+    assert objective["eval_backbone"] is True
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        ("training.domino_lambda_base_start=1.0",),
+        ("training.domino_lambda_base_decay_ratio=1.0",),
+        (
+            "training.domino_lambda_base_start=2.0",
+            "training.domino_lambda_base_decay_ratio=1.0",
+        ),
+        (
+            "training.domino_lambda_base_start=1.0",
+            "training.domino_lambda_base_decay_ratio=0.0",
+        ),
+    ],
+)
+def test_plan_rejects_invalid_domino_lambda_curriculum(tmp_path, overrides):
+    config, args = _config(tmp_path, *overrides)
+    with pytest.raises(PlanCompileError):
+        compile_execution_plan(config, config_path=str(_EXAMPLE), cli_args=args)
+
+
+def test_lambda_curriculum_matches_reference_linear_decay():
+    trainer = object.__new__(DominoTrainer)
+    trainer.lambda_base = 0.3
+    trainer.lambda_base_start = 1.0
+    trainer.lambda_base_decay_ratio = 1.0
+    trainer.lambda_total_steps = 8
+    assert trainer._lambda_base_for_step(0) == pytest.approx(1.0)
+    assert trainer._lambda_base_for_step(2) == pytest.approx(0.75)
+    assert trainer._lambda_base_for_step(4) == pytest.approx(0.5)
+    assert trainer._lambda_base_for_step(8) == pytest.approx(0.0)
+    assert trainer._lambda_base_for_step(99) == pytest.approx(0.0)
+
+    trainer.lambda_base_start = None
+    trainer.lambda_base_decay_ratio = None
+    assert trainer._lambda_base_for_step(4) == pytest.approx(0.3)
+
+
+def test_backbone_eval_metrics_merge_with_prefix():
+    corrected = {
+        "eval/ploss_0": 1.0,
+        "eval/acc_0": 0.5,
+        "eval/avg_loss": 2.0,
+        "eval/avg_acc": 0.25,
+        "eval/mixed_ce": 2.0,
+        "eval/backbone_ce": 3.0,
+    }
+    backbone = {
+        "eval/ploss_0": 9.0,
+        "eval/acc_0": 0.1,
+        "eval/avg_loss": 8.0,
+        "eval/avg_acc": 0.2,
+        "eval/simulated_acc_len": 0.3,
+        "eval/mixed_ce": 2.0,
+    }
+    merged = DominoTrainer._merge_backbone_eval_metrics(corrected, backbone)
+    assert merged["eval/ploss_0"] == 1.0
+    assert merged["eval/backbone_ploss_0"] == 9.0
+    assert merged["eval/backbone_acc_0"] == 0.1
+    assert merged["eval/backbone_avg_loss"] == 8.0
+    assert merged["eval/backbone_avg_acc"] == 0.2
+    assert merged["eval/backbone_simulated_acc_len"] == 0.3
+    assert merged["eval/mixed_ce"] == 2.0
+    assert "eval/backbone_mixed_ce" not in merged
+
+
 def test_plan_rejects_explicit_cudnn_gqa_mode(tmp_path):
     raw = json.loads(_DRAFT_JSON.read_text(encoding="utf-8"))
     raw["cudnn_gqa_mode"] = "native"
@@ -208,7 +290,9 @@ def _trainer_args():
         dflash_block_size=5, dflash_num_anchors=2, dflash_num_target_layers=1,
         dflash_loss_objective="decay", dflash_dpace_alpha=0.5,
         dflash_loss_decay_gamma=7.0, dflash_ce_loss_alpha=1.0, dflash_l1_loss_alpha=0.0,
-        domino_lambda_base=0.3, anchor_sampling_scope="row",
+        domino_lambda_base=0.3, domino_lambda_base_start=None,
+        domino_lambda_base_decay_ratio=None, domino_eval_backbone=False,
+        anchor_sampling_scope="row", lr_total_steps=8, num_train_steps=8,
         deterministic_anchor_sampling=False, max_seq_length=128, micro_batch_size=1,
         draft_accumulation_steps=1, max_grad_norm=1.0, seed=42,
         draft_context_parallel_size=1, training_num_nodes=1, training_num_gpus_per_node=2,
@@ -289,5 +373,38 @@ def test_checkpoint_topology_pins_domino_objective():
     _validate_exact_resume_topology(args, metadata)
     changed = json.loads(json.dumps(metadata))
     changed["training_topology"]["training_objective"]["lambda_base"] = 0.5
+    with pytest.raises(RuntimeError):
+        _validate_exact_resume_topology(args, changed)
+
+
+def test_exact_resume_rejects_adding_curriculum_to_legacy_checkpoint():
+    args = _trainer_args()
+    legacy = _logical_training_topology(args, 2)
+    legacy["training_objective"].pop("lambda_base_start", None)
+    legacy["training_objective"].pop("lambda_base_decay_ratio", None)
+    metadata = {"world_size": 2, "training_topology": json.loads(json.dumps(legacy))}
+    _validate_exact_resume_topology(args, metadata)
+
+    args.domino_lambda_base_start = 1.0
+    args.domino_lambda_base_decay_ratio = 1.0
+    with pytest.raises(RuntimeError, match="lambda_base curriculum"):
+        _validate_exact_resume_topology(args, metadata)
+
+
+def test_checkpoint_topology_pins_domino_lambda_curriculum():
+    args = _trainer_args()
+    args.domino_lambda_base_start = 1.0
+    args.domino_lambda_base_decay_ratio = 1.0
+    current = _logical_training_topology(args, 2)
+    objective = current["training_objective"]
+    assert objective["lambda_base_start"] == 1.0
+    assert objective["lambda_base_decay_ratio"] == 1.0
+
+    metadata = {"world_size": 2, "training_topology": json.loads(json.dumps(current))}
+    _validate_exact_resume_topology(args, metadata)
+    changed = json.loads(json.dumps(metadata))
+    changed["training_topology"]["training_objective"][
+        "lambda_base_decay_ratio"
+    ] = 0.5
     with pytest.raises(RuntimeError):
         _validate_exact_resume_topology(args, changed)
