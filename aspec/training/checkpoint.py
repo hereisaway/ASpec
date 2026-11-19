@@ -1170,6 +1170,18 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
     dist.barrier()
 
 
+def _checkpoint_writer(path: Path):
+    """Use the serial CPU loader for deterministic CUDA-to-host copies.
+
+    PyTorch's overlapping pinned-copy loader can raise ``cudaErrorInvalidValue``
+    on some hosts after several optimizer steps. The serial loader keeps the
+    checkpoint contents unchanged while avoiding that runtime-only failure.
+    """
+    from torch.distributed.checkpoint import FileSystemWriter
+
+    return FileSystemWriter(path, per_thread_copy_ahead=0)
+
+
 def save(actor: Any, step: int) -> None:
     """Save checkpoint to disk.
 
@@ -1196,17 +1208,17 @@ def save(actor: Any, step: int) -> None:
     # Save model weights
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
-    dcp.save(state_dict, checkpoint_id=str(model_dir))
+    dcp.save(state_dict, storage_writer=_checkpoint_writer(model_dir))
 
     if hasattr(actor, "optimizer") and actor.optimizer is not None:
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
-        dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir))
+        dcp.save(optim_state_dict, storage_writer=_checkpoint_writer(optimizer_dir))
 
     if hasattr(actor, "lr_scheduler") and actor.lr_scheduler is not None:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
-        dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
+        dcp.save(lr_scheduler_state_dict, storage_writer=_checkpoint_writer(lr_scheduler_dir))
 
     _save_rank_rng_state(
         checkpoint_dir,
