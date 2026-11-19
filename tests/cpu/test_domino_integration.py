@@ -399,6 +399,7 @@ def test_checkpoint_topology_pins_domino_lambda_curriculum():
     objective = current["training_objective"]
     assert objective["lambda_base_start"] == 1.0
     assert objective["lambda_base_decay_ratio"] == 1.0
+    assert objective["lambda_base_total_steps"] == 8
 
     metadata = {"world_size": 2, "training_topology": json.loads(json.dumps(current))}
     _validate_exact_resume_topology(args, metadata)
@@ -408,3 +409,15 @@ def test_checkpoint_topology_pins_domino_lambda_curriculum():
     ] = 0.5
     with pytest.raises(RuntimeError):
         _validate_exact_resume_topology(args, changed)
+
+    args.lr_total_steps = 16
+    with pytest.raises(RuntimeError, match="lambda_base_total_steps"):
+        _validate_exact_resume_topology(args, metadata)
+
+    missing_horizon = json.loads(json.dumps(metadata))
+    del missing_horizon["training_topology"]["training_objective"][
+        "lambda_base_total_steps"
+    ]
+    args.lr_total_steps = 8
+    with pytest.raises(RuntimeError, match="lambda_base_total_steps"):
+        _validate_exact_resume_topology(args, missing_horizon)

@@ -42,6 +42,15 @@ CHECKPOINT_COMPLETION_SCHEMA_VERSION = "aspec.checkpoint-completion/v1"
 RNG_STATE_SCHEMA_VERSION = "aspec.rng-state/v1"
 
 
+def _domino_lambda_horizon(args: Any) -> int | None:
+    value = getattr(args, "lr_total_steps", None) or getattr(
+        args, "num_train_steps", None
+    )
+    if not value:
+        return None
+    return int(value)
+
+
 def _logical_training_topology(args: Any, world_size: int) -> dict[str, Any]:
     """Return resume-relevant logical topology without physical host identity."""
 
@@ -114,6 +123,14 @@ def _logical_training_topology(args: Any, world_size: int) -> dict[str, Any]:
             topology["training_objective"]["lambda_base_decay_ratio"] = getattr(
                 args, "domino_lambda_base_decay_ratio", None
             )
+            if getattr(args, "domino_lambda_base_start", None) is not None:
+                horizon = _domino_lambda_horizon(args)
+                if horizon is None:
+                    raise RuntimeError(
+                        "Domino lambda_base curriculum requires an effective "
+                        "lr_total_steps or num_train_steps horizon"
+                    )
+                topology["training_objective"]["lambda_base_total_steps"] = horizon
     if "training_objective" in topology:
         fields = ("max_seq_length", "micro_batch_size", "draft_accumulation_steps",
                   "max_grad_norm", "seed")
@@ -224,6 +241,10 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
             key for key in ("lambda_base", "block_size", "loss", "loss_decay_gamma")
             if key not in objective
         ]
+        if objective.get("lambda_base_start") is not None and (
+            "lambda_base_total_steps" not in objective
+        ):
+            missing.append("lambda_base_total_steps")
         missing += [
             key for key in ("shift_label", "pure_draft_prefix_len")
             if key not in semantics
