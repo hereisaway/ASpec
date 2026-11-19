@@ -32,7 +32,6 @@ import torch
 
 from aspec.config.mooncake_config import MooncakeConfig
 from aspec.inference.target_prefill import TargetPrefillDirectSink, TargetPrefillRequest
-from aspec.transfer.mooncake import EagleMooncakeStore
 
 
 class StreamingLayerAccumulator:
@@ -125,7 +124,8 @@ class TrainingFeaturePublisher:
         self.backbone = model.model
         if self.final_hidden_as_aux:
             if len(self.layers) != 1 or self.store_last:
-                raise ValueError("Native MTP requires one post-norm feature, without a duplicate teacher")
+                raise ValueError(
+                    "Native MTP/Medusa requires one post-norm feature, without a duplicate teacher")
             # The verifier LM-head boundary already supplies the final normalized
             # state. Do not ask an auxiliary setter to translate a last-layer ID
             # into the out-of-range layer after it.
@@ -172,10 +172,11 @@ class TrainingFeaturePublisher:
             try:
                 if self.final_hidden_as_aux and isinstance(hidden_states, tuple):
                     # Qwen's outer multimodal wrapper only unpacks its model
-                    # return when auxiliary capture is enabled. Native MTP has
-                    # no such capture; preserve the direct sink at our boundary.
+                    # return when auxiliary capture is enabled. This single-slot
+                    # path has no such capture; preserve the direct sink.
                     if len(hidden_states) != 2 or hidden_states[1] is not self.sink:
-                        raise RuntimeError("Native MTP received an unexpected verifier output tuple")
+                        raise RuntimeError(
+                            "Final-hidden feature production received an unexpected verifier output tuple")
                     hidden_states, aux_hidden_states = hidden_states
                 # The native LM-head boundary restores sequence-sharded rows.
                 # Every TP rank must participate even though only rank zero
@@ -242,6 +243,10 @@ class TrainingFeaturePublisher:
 
     def _store(self, device):
         if self.store is None:
+            # Keep the native Mooncake dependency out of module import so
+            # config-only users (hook compilation, CPU checks) do not need it.
+            from aspec.transfer.mooncake import EagleMooncakeStore
+
             self.store = EagleMooncakeStore(MooncakeConfig.from_env())
             self.store.setup(device=device, p2p_role="source")
             from aspec.utils.timeline import get_timeline_from_env
@@ -593,7 +598,7 @@ def training_engine_kwargs(kwargs, args):
             "max_sequence_length": args.max_seq_length,
             "store_last_hidden_states": args.store_last_hidden_states,
             "direct_prefill": args.target_prefill_memory_optimized,
-            "final_hidden_as_aux": getattr(args, "draft_algorithm", None) == "mtp",
+            "final_hidden_as_aux": getattr(args, "draft_algorithm", None) in {"mtp", "medusa"},
             "attention_backend": args.attention_backend,
             **({"mtp": args.aspec_feature_contract["mtp"], "target_model_path": args.target_model_path}
                if (getattr(args, "aspec_feature_contract", None) or {}).get("mtp") is not None else {}),

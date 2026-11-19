@@ -36,6 +36,14 @@ class MedusaConfig(PretrainedConfig):
             raise ValueError("Medusa uses the full Target vocabulary")
         if kwargs.get("ffn_type", "dense") != "dense" or kwargs.get("lm_head_rank_divisor"):
             raise ValueError("Medusa heads have no FFN or replaceable output head")
+        if (kwargs.get("layer_types") or kwargs.get("sliding_window") is not None
+                or kwargs.get("use_sliding_window")):
+            raise ValueError("Medusa heads have no attention schedule or sliding window")
+        if any(kwargs.get(key) not in (None, 0) for key in (
+                "num_experts", "num_experts_per_tok", "moe_intermediate_size",
+                "router_aux_loss_coef", "num_shared_experts", "n_shared_experts",
+                "shared_expert_intermediate_size", "moe_shared_expert_intermediate_size")):
+            raise ValueError("Medusa heads have no FFN or expert routing")
         if "num_hidden_layers" in kwargs:
             raise ValueError("Medusa is heads-only; use medusa_num_layers for head depth")
         # The single post-norm final-state slot is the native-MTP feature convention.
@@ -94,10 +102,15 @@ class MedusaResBlock(nn.Module):
 
 class MedusaDraftModel(nn.Module):
     config_class = MedusaConfig
+    # Heads-only: load_embedding/freeze_embedding are no-ops, so do not report a frozen embedding.
+    frozen_part_labels: tuple[str, ...] = ()
 
-    def __init__(self, config):
+    def __init__(self, config, attention_backend="sdpa"):
         super().__init__()
+        if attention_backend != "sdpa":
+            raise NotImplementedError("Medusa heads have no attention; use the sdpa backend")
         self.config = config
+        self.attention_backend = attention_backend
         self.medusa_num_heads = config.medusa_num_heads
         self.medusa_num_layers = config.medusa_num_layers
         self.hidden_size = config.hidden_size
@@ -114,3 +127,12 @@ class MedusaDraftModel(nn.Module):
     def forward(self, hidden_states):
         """[B, S, H] frozen Target features -> [K, B, S, V] per-head logits."""
         return torch.stack([head(hidden_states) for head in self.medusa_head], dim=0)
+
+    def load_embedding(self, target_model_path, embedding_key=None):
+        """Heads-only: the draft reads Target features and owns no token embedding."""
+
+    def freeze_embedding(self):
+        """Heads-only: the draft reads Target features and owns no token embedding."""
+
+    def freeze_lm_head(self):
+        raise ValueError("Medusa heads own trainable vocabulary projections")

@@ -23,6 +23,11 @@ def resolve_draft_structure(raw: Mapping) -> dict:
         from aspec.config.eagle4 import eagle4_structure
 
         return eagle4_structure(raw)
+    if raw.get("architectures") == ["MedusaDraftModel"]:
+        if any(raw.get(key) not in (None, 0) for key in (
+                "router_z_loss_coef", "moe_router_enable_expert_bias")):
+            raise ValueError("Medusa heads have no FFN or expert routing")
+        return {"ffn_type": "heads_only"}
     ffn_type = raw.get("ffn_type", "dense")
     if ffn_type not in {"dense", "qwen3_moe", "ling_moe"}:
         raise ValueError(f"Unsupported Draft ffn_type={ffn_type!r}")

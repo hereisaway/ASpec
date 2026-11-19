@@ -301,6 +301,54 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
         if _select(config, "inference.store_last_hidden_states"):
             raise PlanCompileError("Native MTP publishes final post-norm features once; set store_last_hidden_states=false")
 
+    if family == "medusa":
+        from aspec.models.draft.medusa import MedusaConfig
+
+        try:
+            raw = MedusaConfig.from_dict(raw).to_dict()
+        except (ValueError, TypeError) as exc:
+            raise PlanCompileError(str(exc)) from exc
+        target_path = _select(config, "model.target_model_path")
+        target_config = (
+            _target_config_with_sglang_overrides(config, target_path) if target_path else None)
+        if target_config is not None:
+            target_vocab = target_config.get("vocab_size")
+            text_config = target_config.get("text_config")
+            if target_vocab is None and isinstance(text_config, Mapping):
+                target_vocab = text_config.get("vocab_size")
+            if (isinstance(target_vocab, int) and not isinstance(target_vocab, bool)
+                    and target_vocab != raw.get("vocab_size")):
+                raise PlanCompileError(
+                    "Medusa projects the full Target vocabulary: draft vocab_size "
+                    f"{raw.get('vocab_size')} != Target vocab_size {target_vocab}")
+        backend = _select(config, "training.attention_backend")
+        if backend != "sdpa":
+            raise PlanCompileError("Medusa heads have no attention; use training.attention_backend=sdpa")
+        if _select(config, "training.dflash_packing", False):
+            raise PlanCompileError("Medusa does not implement sequence packing yet")
+        # load_config rejects CP>1 for SDPA before this point; keep the family
+        # guard for direct compile_execution_plan callers.
+        if _select(config, "training.draft_context_parallel_size", 1) != 1:
+            raise PlanCompileError("Medusa currently supports draft_context_parallel_size=1")
+        if _select(config, "training.micro_batch_size", 1) != 1:
+            raise PlanCompileError("Medusa currently supports micro_batch_size=1")
+        if str(_select(config, "training.fsdp_strategy", "REPLICATE")).upper() != "REPLICATE":
+            raise PlanCompileError("Medusa currently supports fsdp_strategy=REPLICATE")
+        if (_select(config, "training.training_num_nodes", 1) != 1
+                or _select(config, "cluster.mode", "single_node") != "single_node"):
+            raise PlanCompileError("Medusa currently supports a single node")
+        if _select(config, "inference.store_last_hidden_states", False):
+            raise PlanCompileError(
+                "Medusa publishes final post-norm features once; set store_last_hidden_states=false")
+        if _select(config, "training.compile_model", False):
+            raise PlanCompileError("Medusa whole-model compile has not been enabled")
+        if _select(config, "model.freeze_lm_head", False):
+            raise PlanCompileError("Medusa heads own trainable vocabulary projections")
+        if _select(config, "training.eagle3_num_anchors", 0):
+            raise PlanCompileError("Medusa does not implement anchored training")
+        if _select(config, "training.ploss_weights") is not None:
+            raise PlanCompileError("Medusa fixes uniform per-head loss weights")
+
     if family == "eagle4":
         from aspec.config.eagle4 import Eagle4Config, eagle4_policy
 
@@ -618,6 +666,8 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
         "target_hidden_size": raw.get("target_hidden_size"),
         "target_num_hidden_layers": raw.get("target_num_hidden_layers"),
         "target_layer_ids": target_layer_ids,
+        "medusa_num_heads": raw.get("medusa_num_heads"),
+        "medusa_num_layers": raw.get("medusa_num_layers"),
     }
 
 
@@ -1214,7 +1264,7 @@ def _validate_scope(args: argparse.Namespace, draft: Mapping[str, Any]) -> None:
             f"got {declared_target_layers} and {expected_target_layers}"
         )
     training_target_layers = (
-        expected_target_layers if draft["family"] in {"eagle3", "eagle4", "mtp"} else getattr(
+        expected_target_layers if draft["family"] in {"eagle3", "eagle4", "mtp", "medusa"} else getattr(
             args,
             "dspark_num_target_layers" if draft["family"] == "dspark" else "dflash_num_target_layers",
         )
@@ -1227,7 +1277,7 @@ def _validate_scope(args: argparse.Namespace, draft: Mapping[str, Any]) -> None:
 
     block_size = getattr(args, "dflash_block_size", 16)
     min_loss_tokens = getattr(args, "min_loss_tokens", 0)
-    if draft["family"] not in {"eagle3", "eagle4", "mtp"} and min_loss_tokens < 2 * block_size:
+    if draft["family"] not in {"eagle3", "eagle4", "mtp", "medusa"} and min_loss_tokens < 2 * block_size:
         raise PlanCompileError(
             f"{draft['family']} requires dataset.min_loss_tokens >= "
             f"2 * training.dflash_block_size ({min_loss_tokens} < {2 * block_size})"
@@ -1253,6 +1303,11 @@ def _runtime_values(config: DictConfig, draft: Mapping[str, Any], *, source_cont
         args.ttt_length = args.mtp_steps  # common recurrent trainer's metric slots
         args.ploss_weights = mtp_step_weights(args.mtp_steps, args.mtp_step_weight_beta)
         args.freeze_lm_head = True
+    elif args.draft_algorithm == "medusa":
+        args.ttt_length = draft["medusa_num_heads"]
+        # The reference sums per-head mean CEs; the trainer applies ttt weights.
+        args.ploss_weights = [1.0] * args.ttt_length
+        args.freeze_lm_head = False
     args.source_context_parallel_size = (args.draft_context_parallel_size
                                         if source_context_parallel_size is None else source_context_parallel_size)
     if args.draft_algorithm in {"eagle3", "eagle4"} and args.ploss_weights is None:
@@ -1332,6 +1387,19 @@ def _workload(
         for side in ("target", "draft"):
             for name, default in (("temperature", 1.0), ("top_p", 1.0), ("top_k", -1)):
                 objective[f"l1_{side}_{name}"] = _select(config, f"training.dspark_l1_{side}_{name}", default)
+    elif family == "medusa":
+        objective = {
+            "family": "medusa",
+            "loss": "parallel_future_token_ce",
+            "num_heads": draft["medusa_num_heads"],
+            "num_layers": draft["medusa_num_layers"],
+            "prediction_start": 2,
+            "head_weighting": "sum_of_per_head_mean_ce",
+            "frozen_shared": ["target_features"],
+            "verifier_feature_stage": "post_norm",
+            "vocab_scope": "full_target_vocabulary",
+            "gradient_checkpointing": _select(config, "training.gradient_checkpointing"),
+        }
     else:
         objective = {
             "family": family,

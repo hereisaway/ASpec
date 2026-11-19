@@ -153,3 +153,14 @@ python -m tools.stitch_native_mtp --target /path/to/Qwen3.5-9B \
 
 The original Target is not overwritten. Official SGLang consumption selects `EAGLE`, not a `MTP`
 flag. A format manifest does not replace testing the particular exported asset with its consumer.
+
+## Medusa heads-only
+
+`aspec/config/medusa_qwen3_8b_draft_config.json` trains K parallel heads on the frozen Target's
+post-norm final state; head `i` at position `t` is supervised by token `t+2+i`. The objective is
+the sum of per-head mean cross-entropies (assistant tokens only): each head's CE is averaged
+within a microbatch, and microbatches are weighted equally by gradient accumulation rather than
+pooled by token count. The heads own trainable full-vocabulary projections. Start from
+`configs/examples/medusa_qwen3_8b_4k_tcp.yaml` (SDPA, CP1, MBS1, non-packing, REPLICATE,
+Store/TCP). Export, a maintained recipe, per-head held-out observations and candidate-tree
+acceptance remain future work; see [details](medusa.md).
