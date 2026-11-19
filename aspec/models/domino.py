@@ -151,6 +151,9 @@ class DominoModel(DFlashModel):
             # Keep the same-forward backbone values for evaluation; the mixed
             # loss and corrected reporting branch are unchanged.
             self._last_backbone_report = (base_per_token.detach(), base_logits.detach())
+        else:
+            # Never retain the last evaluation logits across training.
+            self._last_backbone_report = None
         # Report the corrected objective's per-position value; accuracy uses the
         # corrected logits as well.
         return loss_per_token, corrected_per_token, corrected_logits
@@ -167,21 +170,26 @@ class DominoModel(DFlashModel):
         if not self.collect_extra_position_metrics or self._last_backbone_report is None:
             return {}
         base_per_token, base_logits = self._last_backbone_report
-        block_size = self.block_size
-        base_loss_pp = base_per_token.reshape(bsz, n_blocks, block_size)
-        vocab_size = base_logits.size(-1)
-        base_pred = base_logits.reshape(-1, vocab_size).argmax(-1)
-        correct = (base_pred.view(bsz, n_blocks, block_size) == target_ids) & (
-            binary_weights > 0.5
-        )
-        safe_count = count_per_position.clamp(min=1.0)
-        loss_pp = (base_loss_pp * binary_weights).sum(dim=(0, 1)) / safe_count
-        acc_pp = correct.float().sum(dim=(0, 1)) / safe_count
-        return {
-            "backbone_loss_pp": loss_pp.detach(),
-            "backbone_acc_pp": acc_pp.detach(),
-            "backbone_count_pp": count_per_position.detach(),
-        }
+        try:
+            block_size = self.block_size
+            base_loss_pp = base_per_token.reshape(bsz, n_blocks, block_size)
+            vocab_size = base_logits.size(-1)
+            base_pred = base_logits.reshape(-1, vocab_size).argmax(-1)
+            correct = (base_pred.view(bsz, n_blocks, block_size) == target_ids) & (
+                binary_weights > 0.5
+            )
+            safe_count = count_per_position.clamp(min=1.0)
+            loss_pp = (base_loss_pp * binary_weights).sum(dim=(0, 1)) / safe_count
+            acc_pp = correct.float().sum(dim=(0, 1)) / safe_count
+            return {
+                "backbone_loss_pp": loss_pp.detach(),
+                "backbone_acc_pp": acc_pp.detach(),
+                "backbone_count_pp": count_per_position.detach(),
+            }
+        finally:
+            # The full logits share storage with the forward graph; keep only
+            # the reduced position tensors and release the report immediately.
+            self._last_backbone_report = None
 
     def _extra_training_loss(
         self,
