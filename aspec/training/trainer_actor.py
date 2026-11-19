@@ -56,6 +56,10 @@ def _trainer_class_for_config(draft_model_config):
         from aspec.training.domino_trainer import DominoTrainer
 
         return DominoTrainer
+    if getattr(draft_model_config, "architectures", None) == ["JetSpecDraftModel"]:
+        from aspec.training.jetspec_trainer import JetSpecTrainer
+
+        return JetSpecTrainer
     if isinstance(draft_model_config, DFlash2Config):
         from aspec.training.dflash2_trainer import DFlash2Trainer
 
@@ -75,7 +79,7 @@ def _trainer_class_for_config(draft_model_config):
 
         return Eagle3Trainer
     raise ValueError(
-        "ASpec supports DSpark, DFlash, Domino, EAGLE3, native MTP and Medusa draft model configs; "
+        "ASpec supports DSpark, DFlash, Domino, JetSpec, EAGLE3, native MTP and Medusa draft model configs; "
         f"got {type(draft_model_config).__name__}"
     )
 

@@ -115,13 +115,16 @@ anchor-shared window. FA4 preserves
 convolution, selector, document boundaries and CP ownership. Functional results do not establish
 official-recipe reproduction or long-term quality.
 
-## JetSpec core prerequisite
+## JetSpec
 
-The [JetSpec model/loss API](jetspec.md) combines the retained DFlash block head
-with causal intra-block attention and a temperature-scaled forward-KL objective
-against frozen Target features. `JetSpecConfig` forces that causal contract and
-rejects incompatible structures. Public training, tree construction, recovery,
-export and consumer validation remain pending.
+The [JetSpec workflow](jetspec.md) combines the retained DFlash block head with
+causal intra-block attention and a temperature-scaled forward-KL objective against
+frozen Target features. `JetSpecConfig` forces that causal contract and rejects
+incompatible structures. The ASpec training CLI selects the algorithm through a
+shipped Qwen3-8B Draft config and a JetSpec trainer that reuses the DFlash
+optimizer/checkpoint path. FlexAttention, CP1, padded/non-packing execution and
+exact recovery are the initial scope. Tree construction, export and consumer
+acceptance remain pending.
 
 ## Native MTP conditioning for DSpark/DFlash
 

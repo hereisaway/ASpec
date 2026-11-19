@@ -36,6 +36,7 @@ from aspec.models.draft.dspark import (
     K3DSparkModel,
 )
 from aspec.models.draft.eagle4 import Eagle4DraftModel
+from aspec.models.draft.jetspec import JetSpecConfig, JetSpecDraftModel
 from aspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from aspec.models.draft.medusa import MedusaConfig, MedusaDraftModel
 from aspec.models.draft.mtp import NativeMTPConfig, NativeMTPDraftModel
@@ -50,6 +51,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         NativeMTPConfig: NativeMTPDraftModel,
         MedusaConfig: MedusaDraftModel,
         DominoConfig: DominoDraftModel,
+        JetSpecConfig: JetSpecDraftModel,
         DFlashConfig: DFlashDraftModel,
         DFlash2Config: DFlash2DraftModel,
         DSparkConfig: DSparkDraftModel,
@@ -74,6 +76,7 @@ class AutoDraftModelConfig:
         "NativeMTPDraftModel": NativeMTPConfig,
         "MedusaDraftModel": MedusaConfig,
         "DominoDraftModel": DominoConfig,
+        "JetSpecDraftModel": JetSpecConfig,
         "DFlashDraftModel": DFlashConfig,
         "DFlash2DraftModel": DFlash2Config,
         "Qwen3DSparkModel": DSparkConfig,

@@ -1,10 +1,85 @@
-# JetSpec model and loss core
+# JetSpec Draft training
 
-This is the first prerequisite for [ASpec #15](https://github.com/inclusionAI/ASpec/issues/15).
-It provides `aspec.models.jetspec.JetSpecModel`,
-`aspec.models.draft.jetspec.JetSpecConfig` and
-`aspec.models.draft.jetspec.JetSpecDraftModel`. It is a model/loss API; the ASpec
-training CLI does not select this algorithm yet.
+This implements [ASpec #15](https://github.com/inclusionAI/ASpec/issues/15) for the
+model/loss and initial training path through
+`aspec.models.jetspec.JetSpecModel`,
+`aspec.models.draft.jetspec.JetSpecConfig`,
+`aspec.models.draft.jetspec.JetSpecDraftModel` and
+`aspec.training.jetspec_trainer.JetSpecTrainer`. The ASpec training CLI selects this
+algorithm through `aspec/config/jetspec_qwen3_8b_draft_config.json`; the
+[example workflow](../../configs/examples/jetspec_qwen3_8b_4k_tcp.yaml) runs one
+Target GPU plus two Draft GPUs at 4K (three GPUs total).
+
+## Training selection
+
+- Draft config: `aspec/config/jetspec_qwen3_8b_draft_config.json` (Qwen3-8B,
+  `block_size=16`, `is_causal=true`).
+- Example: `configs/examples/jetspec_qwen3_8b_4k_tcp.yaml` (FlexAttention, CP1, MBS1,
+  non-packing, REPLICATE, Store/TCP transport,
+  `inference.store_last_hidden_states=true`).
+- The supported path fails closed outside dense full attention, padded inputs,
+  `attention_backend=flex_attention`, `draft_context_parallel_size=1` and
+  `dflash_packing=false`. MoE, sliding-window layers, MTP conditioning, packing,
+  CP>1 and whole-model compile are rejected during Plan compilation or
+  configuration. The CPU dense fallback builds the same causal block mask for
+  contract tests; the training path requires FlexAttention.
+- Exact recovery records the architecture, causal block size, temperature, KL chunk
+  size and uniform/decay weighting. Changing any of them requires a weights-only
+  new stage.
+
+## Running
+
+Prepare the Target in a separate environment and keep it running on GPU 0:
+
+```bash
+aspec patch-sglang
+CUDA_VISIBLE_DEVICES=0 aspec target \
+  --config configs/examples/jetspec_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B
+```
+
+Compile the example, then train with two Draft GPUs (GPUs 1 and 2):
+
+```bash
+aspec --config configs/examples/jetspec_qwen3_8b_4k_tcp.yaml --dry-run \
+  model.target_model_path=/path/to/Qwen3-8B
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/jetspec_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B
+```
+
+For exact recovery, stop the first run at step 4 while keeping `lr_total_steps=8`,
+then resume that checkpoint into a fresh directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/jetspec_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B \
+  training.num_train_steps=4 training.lr_total_steps=8 \
+  output_dir=outputs/jetspec_qwen3_8b_4k_tcp_step4
+
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/jetspec_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B \
+  training.load_path=outputs/jetspec_qwen3_8b_4k_tcp_step4/checkpoints \
+  training.num_train_steps=8 training.lr_total_steps=8 \
+  training.continual_training=false \
+  output_dir=outputs/jetspec_qwen3_8b_4k_tcp_resumed
+```
+
+The example is a short functional smoke-test recipe, not evidence of convergence,
+throughput or decoding acceptance. Public CI is CPU-only; GPU end-to-end training
+and exact resume still need a hardware run before making quality claims.
+
+## Validation status
+
+Registration, Plan compilation, trainer construction, checkpoint topology and the
+CPU numerical contracts are covered by `tests/cpu`. The CPU checks cover the
+configuration contract, causal mask construction, bounded forward KL and gradients
+against independent equations, explicit-mask and packed fail-closed paths,
+anchor/loss-mask exclusion, empty supervision and next-token label/teacher
+alignment. GPU attention execution, convergence, acceptance length and serving
+performance are not certified by those checks.
 
 ## Reference and selected method
 
@@ -118,14 +193,10 @@ The return value follows `DFlashModel.forward`: scalar loss, accuracy,
 per-position loss/accuracy/count, extra components and the objective numerator /
 denominator. Per-position loss now reports KL rather than CE.
 
-## Boundaries and validation
+## Boundaries
 
-- This core does not provide a recipe, trainer selection, exact resume, tree
-  construction, export, strict reloading or a serving consumer. Those remain for
+- This integration does not provide tree construction, export, strict reloading,
+  held-out acceptance observations or a serving consumer. Those remain for
   follow-up work under the issue's expected outcomes.
-- CPU checks cover the configuration contract, causal mask construction, bounded
-  forward KL and gradients against independent equations, explicit-mask and packed
-  fail-closed paths, anchor/loss-mask exclusion, empty supervision and next-token
-  label/teacher alignment on unpacked inputs. They do not certify GPU attention
-  execution, convergence, acceptance length or serving performance.
-- The default tests are in `tests/cpu/test_jetspec.py`.
+- The default tests are in `tests/cpu/test_jetspec.py` and
+  `tests/cpu/test_jetspec_integration.py`.

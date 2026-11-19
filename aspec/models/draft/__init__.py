@@ -28,6 +28,7 @@ from aspec.models.draft.dspark import (
     K3DSparkConfig,
     K3DSparkModel,
 )
+from aspec.models.draft.jetspec import JetSpecConfig, JetSpecDraftModel
 
 __all__ = [
     "AutoDraftModelConfig",
@@ -38,6 +39,8 @@ __all__ = [
     "DFlash2DraftModel",
     "DominoConfig",
     "DominoDraftModel",
+    "JetSpecConfig",
+    "JetSpecDraftModel",
     "DSparkConfig",
     "DSparkDraftModel",
     "K3DSparkConfig",

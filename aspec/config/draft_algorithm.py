@@ -20,6 +20,7 @@ DRAFT_ALGORITHMS = {
     "NativeMTPDraftModel": "mtp",
     "MedusaDraftModel": "medusa",
     "DominoDraftModel": "domino",
+    "JetSpecDraftModel": "jetspec",
     "DFlashDraftModel": "dflash",
     "DFlash2DraftModel": "dflash2",
     "DSparkDraftModel": "dspark",

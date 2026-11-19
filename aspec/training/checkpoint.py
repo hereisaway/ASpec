@@ -86,7 +86,7 @@ def _logical_training_topology(args: Any, world_size: int) -> dict[str, Any]:
             key: getattr(args, key, None)
             for key in ("ttt_length", "loss_type", "lk_eta", "ploss_weights")
         }
-    elif getattr(args, "draft_algorithm", None) in {"dflash", "dflash2", "dspark", "domino"}:
+    elif getattr(args, "draft_algorithm", None) in {"dflash", "dflash2", "dspark", "domino", "jetspec"}:
         topology["training_objective"] = {
             "block_size": int(args.dflash_block_size),
             "anchor_sampling_scope": getattr(args, "anchor_sampling_scope", "row"),
@@ -101,7 +101,7 @@ def _logical_training_topology(args: Any, world_size: int) -> dict[str, Any]:
                 for name, default in (("temperature", 1.0), ("top_p", 1.0), ("top_k", -1)):
                     key = f"l1_{side}_{name}"
                     topology["training_objective"][key] = getattr(args, f"dspark_{key}", default)
-        elif args.draft_algorithm == "domino":
+        elif args.draft_algorithm in {"domino", "jetspec"}:
             fields += ("loss_objective",)
         else:
             fields += ("loss_objective", "dpace_alpha")
@@ -131,6 +131,17 @@ def _logical_training_topology(args: Any, world_size: int) -> dict[str, Any]:
                         "lr_total_steps or num_train_steps horizon"
                     )
                 topology["training_objective"]["lambda_base_total_steps"] = horizon
+        if args.draft_algorithm == "jetspec":
+            topology["training_objective"]["loss"] = "temperature_scaled_forward_kl"
+            topology["training_objective"]["distillation_temperature"] = getattr(
+                args, "jetspec_distillation_temperature", 1.0
+            )
+            topology["training_objective"]["kl_chunk_rows"] = getattr(
+                args, "jetspec_kl_chunk_rows", 256
+            )
+            topology["training_objective"]["loss_decay_gamma"] = getattr(
+                args, "jetspec_loss_decay_gamma", 0.0
+            )
     if "training_objective" in topology:
         fields = ("max_seq_length", "micro_batch_size", "draft_accumulation_steps",
                   "max_grad_norm", "seed")
@@ -193,7 +204,7 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
                     raise RuntimeError(f"Exact resume cannot change dspark_{key}; use weights-only initialization")
     # Checkpoints predating this option always sampled per physical row.
     # Missing semantic identity must not authorize a switch to per-sample training.
-    if (getattr(args, "draft_algorithm", None) in {"dspark", "dflash", "dflash2", "domino"}
+    if (getattr(args, "draft_algorithm", None) in {"dspark", "dflash", "dflash2", "domino", "jetspec"}
             and ((saved_topology or {}).get("training_objective") or {}).get(
                 "anchor_sampling_scope", "row"
             ) != getattr(args, "anchor_sampling_scope", "row")):
@@ -225,9 +236,10 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
     ):
         raise RuntimeError("Exact resume cannot change a legacy full-attention checkpoint to SWA")
     if saved_topology is None:
-        if getattr(args, "draft_algorithm", None) == "domino":
+        if getattr(args, "draft_algorithm", None) in {"domino", "jetspec"}:
+            name = "Domino" if args.draft_algorithm == "domino" else "JetSpec"
             raise RuntimeError(
-                "Exact resume requires training_topology for Domino checkpoints; "
+                f"Exact resume requires training_topology for {name} checkpoints; "
                 "use continual_training=true for a weights-only new stage."
             )
         # Older complete checkpoints recorded world_size only.  Preserve that
@@ -263,6 +275,26 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
                 "Exact resume cannot add a lambda_base curriculum to a legacy "
                 "constant-lambda checkpoint; use continual_training=true for a "
                 "new phase."
+            )
+    if getattr(args, "draft_algorithm", None) == "jetspec":
+        objective = saved_topology.get("training_objective") or {}
+        semantics = saved_topology.get("draft_model_semantics") or {}
+        missing = [
+            key for key in (
+                "distillation_temperature", "kl_chunk_rows", "block_size",
+                "loss", "loss_decay_gamma", "ce_loss_alpha", "l1_loss_alpha",
+            )
+            if key not in objective
+        ]
+        missing += [
+            key for key in ("architectures", "block_size", "is_causal")
+            if key not in semantics
+        ]
+        if missing:
+            raise RuntimeError(
+                "Exact resume requires complete JetSpec training_topology; "
+                f"missing {missing}. Use continual_training=true for a "
+                "weights-only new stage."
             )
     if current_policy.get("dsa") is not None:
         # Chunk workspace is an execution bound, not the DSA objective. Preserve
