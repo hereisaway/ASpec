@@ -4,22 +4,24 @@ This implements [ASpec #38](https://github.com/inclusionAI/ASpec/issues/38) thro
 `aspec.models.draft.domino.DominoDraftModel` and
 `aspec.models.domino.DominoModel`: a block-parallel DFlash backbone with a
 GRU-conditioned causal correction head. The ASpec training CLI now selects this
-algorithm through `aspec/config/domino_qwen3_8b_draft_config.json`; the maintained
-[recipe](../../configs/recipes/domino_qwen3_8b.yaml) and the
-[example workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) both run one
-Target GPU plus two Draft GPUs at 4K (three GPUs total).
+algorithm through `aspec/config/domino_qwen3_8b_draft_config.json`. The
+[supplementary held-out example](../../configs/examples/domino_qwen3_8b_eval.yaml)
+and the [smoke workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) both run
+one Target GPU plus two Draft GPUs at 4K (three GPUs total).
 
 ## Training selection
 
 - Draft config: `aspec/config/domino_qwen3_8b_draft_config.json` (Qwen3-8B,
   `block_size=16`, `shift_label=true`, `pure_draft_prefix_len=1`).
-- Recipe: `configs/recipes/domino_qwen3_8b.yaml` (FlexAttention, CP1, non-packing,
-  REPLICATE, Store/TCP transport, held-out eval and the linear `lambda_base`
-  curriculum). The example remains a shorter smoke-test workflow.
+- Held-out example: `configs/examples/domino_qwen3_8b_eval.yaml` (FlexAttention,
+  CP1, non-packing, REPLICATE, Store/TCP transport, held-out eval and the linear
+  `lambda_base` curriculum). Catalog promotion waits for native export/strict
+  reload validation; `domino_qwen3_8b_4k_tcp.yaml` remains a shorter smoke test.
 - `training.domino_lambda_base` is the constant fallback. Set both
   `training.domino_lambda_base_start` and `training.domino_lambda_base_decay_ratio`
   to apply the reference linear schedule. Exact recovery records the constant,
-  schedule, label layout and correction-head dimensions.
+  schedule, effective curriculum horizon, label layout and correction-head
+  dimensions.
 - Set `dataset.eval_data_path` and `training.domino_eval_backbone=true` to report
   held-out corrected and backbone-only observations per prediction position.
 - The supported path fails closed outside dense full attention, padded inputs,
@@ -39,10 +41,9 @@ CUDA_VISIBLE_DEVICES=0 aspec target \
   model.target_model_path=/path/to/Qwen3-8B
 ```
 
-For a maintained recipe with held-out data and the curriculum, set
-`ASPEC_TRAIN_DATA` and `ASPEC_EVAL_DATA` and use
-`configs/recipes/domino_qwen3_8b.yaml`. Compile the example, then train with two
-Draft GPUs (GPUs 1 and 2):
+For held-out data and the curriculum, set `ASPEC_TRAIN_DATA` and `ASPEC_EVAL_DATA`
+and use `configs/examples/domino_qwen3_8b_eval.yaml`. Compile the smoke example,
+then train with two Draft GPUs (GPUs 1 and 2):
 
 ```bash
 aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml --dry-run \
@@ -207,6 +208,7 @@ handling, empty supervision, and frozen Target/embedding behavior.
 ## Remaining work
 
 Native export with strict reloading, Target bindings, proposal consumers and
-acceptance observations remain pending. The next planned increment is the aligned
+acceptance observations remain pending. Recipe catalog promotion also waits for the
+native export/strict reload check. The next planned increment is the aligned
 SpecForge-vs-ASpec comparison. CPU numerical and Plan checks do not establish
 Qwen3-8B training quality, GPU throughput or decoding acceptance.

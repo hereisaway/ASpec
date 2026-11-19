@@ -68,11 +68,11 @@ on the retained DFlash block backbone and mixes corrected with backbone-only
 cross-entropy through `lambda_base`. Both documented label layouts are explicit:
 the unshifted DFlash convention and the official shifted convention
 (`shift_label=true`, `pure_draft_prefix_len=1`). Training now selects the family
-through `aspec/config/domino_qwen3_8b_draft_config.json`; start from the
-`domino` recipe (FlexAttention, CP1, non-packing, Store/TCP). The trainer supports a
-linear `lambda_base` curriculum and held-out corrected/backbone per-position
-observations. Scope is dense full attention with padded inputs only. Native export,
-Target bindings and consumer/acceptance validation remain pending.
+through `aspec/config/domino_qwen3_8b_draft_config.json`; start from the Domino
+examples (FlexAttention, CP1, non-packing, Store/TCP). The trainer supports a linear
+`lambda_base` curriculum and held-out corrected/backbone per-position observations.
+Scope is dense full attention with padded inputs only. Native export, recipe catalog
+promotion, Target bindings and consumer/acceptance validation remain pending.
 
 ## EAGLE4: two stages
 
