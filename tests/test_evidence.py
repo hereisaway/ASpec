@@ -853,6 +853,66 @@ def test_cudnn_flex_attention_execution_activates_from_runtime_evidence(tmp_path
     ]
 
 
+def test_flex_attention_execution_activates_required_jetspec_capability(tmp_path):
+    target = tmp_path / "Qwen3-test"
+    target.mkdir()
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 4096,
+                "vocab_size": 151936,
+                "num_hidden_layers": 36,
+                "max_position_embeddings": 40960,
+            }
+        ),
+        encoding="utf-8",
+    )
+    train_data = tmp_path / "train.jsonl"
+    train_data.write_text("{}\n", encoding="utf-8")
+    example = _REPO_ROOT / "configs" / "examples" / "jetspec_qwen3_8b_4k_tcp.yaml"
+    overrides = [
+        f"model.target_model_path={target}",
+        f"dataset.train_data_path={train_data}",
+        "dataset.eval_data_path=null",
+    ]
+    config = load_config(config_path=str(example), cli_args=overrides)
+    plan = compile_execution_plan(
+        config, config_path=str(example), cli_args=overrides
+    )
+    assert plan.workload.models["draft"]["family"] == "jetspec"
+    recorder = _recorder_for_plan(tmp_path, plan)
+    policy = plan.workload.models["draft"]["attention"]
+
+    recorder.record_training(
+        {
+            "optimizer_steps_observed": 1,
+            "checkpoint": {"enabled": False, "exists": False},
+            "feature_contract": _feature_observation(plan),
+            "execution": {
+                "attention_backend": "flex_attention",
+                "context_parallel_size": 1,
+            },
+        }
+    )
+
+    capability = {
+        item["name"]: item for item in recorder.data["capabilities"]
+    }["draft_attention_execution"]
+    assert capability["requirement"] == "required"
+    assert capability["effective_state"] == "active"
+    assert capability["evidence"] == [
+        {
+            "predicate": "optimizer_steps_consumed_planned_attention_backend_at_planned_cp",
+            "optimizer_steps": 1,
+            "head_layout": policy["head_layout"],
+            "attention_backend": "flex_attention",
+            "context_parallel_size": 1,
+        }
+    ]
+
+
 @pytest.mark.parametrize("observation", ["missing", "wrong_head_layout"])
 def test_full_attention_execution_requires_actual_head_layout(tmp_path, observation):
     overrides = ["training.attention_backend=cudnn_flex_attention"]

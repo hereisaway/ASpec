@@ -1057,7 +1057,9 @@ class RunEvidenceRecorder:
             )
             if (
                 (
-                    planned_attention_backend in {"fa4", "cudnn_flex_attention"}
+                    planned_attention_backend in {
+                        "fa4", "cudnn_flex_attention", "flex_attention",
+                    }
                     or selected_policy_requested
                 )
                 and attention_policy_observed
