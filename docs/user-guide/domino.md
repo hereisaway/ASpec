@@ -144,9 +144,13 @@ loss = (1 - lambda_base) * CE(corrected logits, labels)
      + lambda_base     * CE(backbone logits, labels)
 ```
 
-With both curriculum fields set, the trainer sets the value at optimizer step `s` to
-`start * max(0, 1 - s / max(1, int(lr_total_steps * decay_ratio)))`, matching the
-reference SpecForge Domino schedule. Otherwise it stays at `domino_lambda_base`.
+With both curriculum fields set, the trainer evaluates the value at the 1-based
+microbatch counter `m`:
+`start * max(0, 1 - m / max(1, int(lr_total_steps * decay_ratio)))`.
+`lr_total_steps` is measured in optimizer updates; because the counter advances per
+microbatch, accumulation greater than one reaches zero before the last update,
+matching the reference SpecForge Domino trainer. Otherwise the value stays at
+`domino_lambda_base`.
 `lambda_base=1`
 removes the correction contribution and keeps the selected label layout (the
 correction head receives no useful gradient). It equals the plain DFlash objective
@@ -157,13 +161,14 @@ reused; `ce_loss_alpha=1` and `l1_loss_alpha=0` are enforced. Reporting accuracy
 corrected logits. The trainer reports `mixed_ce` as `train/avg_loss`/`eval/avg_loss`
 (the objective actually used for backward) and exposes `mixed_ce`, `backbone_ce` and
 `corrected_ce` as separate token-pooled component curves. With
-`training.domino_eval_backbone=true`, each held-out evaluation also runs a
-backbone-only reporting pass over the same cached Target features:
+`training.domino_eval_backbone=true`, the same evaluation forward and the same
+sampled anchors produce both branches:
 `eval/ploss_i`/`eval/acc_i` remain corrected, while
 `eval/backbone_ploss_i`/`eval/backbone_acc_i` (plus
 `eval/backbone_avg_loss`, `eval/backbone_avg_acc` and
-`eval/backbone_simulated_acc_len`) describe the backbone-only branch. The mixed
-objective and the trained correction head are unchanged by this reporting mode.
+`eval/backbone_simulated_acc_len`) describe the backbone-only branch. There is no
+second evaluation pass, and the mixed objective and trained correction head are
+unchanged by this reporting mode.
 
 ## Minimal numerical use
 

@@ -48,8 +48,17 @@ class DominoTrainer(DFlashTrainer):
             value = getattr(self, "lambda_total_steps", 1)
         return max(1, int(value))
 
-    def _lambda_base_for_step(self, step: int) -> float:
-        """Linear backbone-weight schedule matching SpecForge's Domino trainer."""
+    def _accumulation_steps(self) -> int:
+        args = getattr(self, "args", None)
+        value = getattr(args, "draft_accumulation_steps", 1) if args is not None else 1
+        return max(1, int(value))
+
+    def _lambda_base_for_micro_step(self, micro_step: int) -> float:
+        """Linear schedule using SpecForge's 1-based microbatch counter.
+
+        ``total_steps`` is measured in optimizer updates; with accumulation > 1
+        the counter advances per microbatch, matching the reference trainer.
+        """
         start = getattr(self, "lambda_base_start", None)
         if start is None:
             return float(getattr(self, "lambda_base", 0.3))
@@ -60,7 +69,7 @@ class DominoTrainer(DFlashTrainer):
                 * float(getattr(self, "lambda_base_decay_ratio", 1.0))
             ),
         )
-        progress = min(max(int(step), 0) / decay_steps, 1.0)
+        progress = min(max(int(micro_step), 1) / decay_steps, 1.0)
         value = float(start) * (1.0 - progress)
         return max(0.0, min(1.0, value))
 
@@ -88,7 +97,7 @@ class DominoTrainer(DFlashTrainer):
             loss_decay_gamma=self.loss_decay_gamma,
             ce_loss_alpha=self.ce_loss_alpha,
             l1_loss_alpha=self.l1_loss_alpha,
-            lambda_base=self._lambda_base_for_step(0),
+            lambda_base=self._lambda_base_for_micro_step(1),
             deterministic_anchor_sampling=getattr(
                 self.args, "deterministic_anchor_sampling", False
             ),
@@ -111,58 +120,68 @@ class DominoTrainer(DFlashTrainer):
         mixed = metrics.get("train/mixed_ce")
         if mixed is not None:
             metrics["train/avg_loss"] = mixed
-        metrics["train/lambda_base"] = self._lambda_base_for_step(
-            max(self.global_step - 1, 0)
-        )
+        last_micro = max(1, int(self.global_step) * self._accumulation_steps())
+        metrics["train/lambda_base"] = self._lambda_base_for_micro_step(last_micro)
         return metrics
 
-    def _train_step(self, *args, **kwargs):
-        # The schedule is a function of the optimizer step, so every micro-batch
-        # in one step uses the same lambda. Exact resume restores global_step.
-        self.dflash.set_lambda_base(self._lambda_base_for_step(self.global_step))
-        return super()._train_step(*args, **kwargs)
+    def _train_step(self, batch, accumulation_steps, step, batch_idx, num_batches):
+        # Match SpecForge: advance the schedule counter before every microbatch.
+        micro_step = (
+            int(self.global_step) * int(accumulation_steps) + int(batch_idx) + 1
+        )
+        self.dflash.set_lambda_base(self._lambda_base_for_micro_step(micro_step))
+        return super()._train_step(
+            batch=batch,
+            accumulation_steps=accumulation_steps,
+            step=step,
+            batch_idx=batch_idx,
+            num_batches=num_batches,
+        )
 
     def eval_from_cache(self):
-        # Evaluate with the lambda used by the most recently completed step,
-        # not the value the next step would use.
-        self.dflash.set_lambda_base(
-            self._lambda_base_for_step(max(self.global_step - 1, 0))
-        )
-        corrected = super().eval_from_cache()
-        if not self.eval_backbone or not corrected:
-            return corrected
-        # Reuse the cached Target features for a backbone-only reporting pass.
-        # The mixed loss and the correction head are unchanged by this flag.
-        self.dflash.report_backbone = True
+        # Evaluate at the value used by the most recently completed microbatch.
+        last_micro = max(1, int(self.global_step) * self._accumulation_steps())
+        self.dflash.set_lambda_base(self._lambda_base_for_micro_step(last_micro))
+        previous = getattr(self.dflash, "collect_extra_position_metrics", False)
+        self.dflash.collect_extra_position_metrics = self.eval_backbone
         try:
-            backbone = super().eval_from_cache()
+            return super().eval_from_cache()
         finally:
-            self.dflash.report_backbone = False
-        return self._merge_backbone_eval_metrics(corrected, backbone)
-
-    @staticmethod
-    def _merge_backbone_eval_metrics(corrected: dict, backbone: dict) -> dict:
-        merged = dict(corrected)
-        for key, value in backbone.items():
-            if not key.startswith("eval/"):
-                continue
-            suffix = key[len("eval/"):]
-            if (
-                suffix in {"avg_loss", "avg_acc"}
-                or "ploss_" in suffix
-                or suffix.startswith("acc_")
-                or "simulated_acc_len" in suffix
-            ):
-                merged[f"eval/backbone_{suffix}"] = value
-        return merged
+            self.dflash.collect_extra_position_metrics = previous
 
     def _aggregate_eval_metrics(self, all_step_metrics):
         metrics = super()._aggregate_eval_metrics(all_step_metrics)
-        if not getattr(self.dflash, "report_backbone", False):
-            mixed = metrics.get("eval/mixed_ce")
-            if mixed is not None:
-                metrics["eval/avg_loss"] = mixed
-        metrics["eval/lambda_base"] = self._lambda_base_for_step(
-            max(self.global_step - 1, 0)
+        mixed = metrics.get("eval/mixed_ce")
+        if mixed is not None:
+            metrics["eval/avg_loss"] = mixed
+        last_micro = max(1, int(self.global_step) * self._accumulation_steps())
+        metrics["eval/lambda_base"] = self._lambda_base_for_micro_step(last_micro)
+        if not all_step_metrics or "backbone_loss_pp" not in all_step_metrics[0]:
+            return metrics
+
+        backbone_loss, backbone_acc, backbone_count = self._reduce_position_metrics(
+            all_step_metrics,
+            loss_key="backbone_loss_pp",
+            acc_key="backbone_acc_pp",
+            count_key="backbone_count_pp",
         )
+        offset = self._anchor_slot_offset
+        pred_loss = backbone_loss[offset:]
+        pred_acc = backbone_acc[offset:]
+        pred_count = backbone_count[offset:]
+        cumulative = 1.0
+        simulated_acc_len = 0.0
+        for i in range(pred_acc.shape[0]):
+            cumulative *= pred_acc[i].item()
+            simulated_acc_len += cumulative
+        avg_loss, avg_acc = self._compute_scalar_metrics(
+            pred_loss, pred_acc, pred_count
+        )
+        prefix = self._prediction_metric_prefix()
+        metrics["eval/backbone_avg_loss"] = avg_loss
+        metrics["eval/backbone_avg_acc"] = avg_acc
+        metrics[f"eval/backbone_{prefix}simulated_acc_len"] = simulated_acc_len
+        for i in range(pred_loss.shape[0]):
+            metrics[f"eval/backbone_{prefix}ploss_{i}"] = pred_loss[i].item()
+            metrics[f"eval/backbone_{prefix}acc_{i}"] = pred_acc[i].item()
         return metrics

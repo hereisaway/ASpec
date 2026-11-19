@@ -285,21 +285,24 @@ def test_lambda_one_recovers_the_backbone_only_objective():
     assert torch.count_nonzero(model.draft_model.context_proj.weight.grad) > 0
 
 
-def test_backbone_reporting_switches_per_position_metrics_only():
+def test_same_forward_backbone_metrics_share_the_anchor_slot():
     model = make_model(lambda_base=0.3, loss_decay_gamma=0.0)
-    inputs = make_inputs()
-    corrected, captured = run_and_capture(model, inputs)
-    model.report_backbone = True
-    backbone, _ = run_and_capture(model, inputs)
-    expected_loss, _, expected_per_position, _ = reference_objective(
-        model, captured, inputs, report="backbone"
-    )
-    torch.testing.assert_close(backbone[0], corrected[0])
-    torch.testing.assert_close(backbone[0], expected_loss, rtol=2e-5, atol=2e-6)
+    inputs = make_inputs(length=20)
+    # Exercise anchor sampling rather than injected anchors.
+    inputs.pop("injected_anchors")
+    inputs.pop("injected_keep_mask")
+    model.collect_extra_position_metrics = True
+    result, _ = run_and_capture(model, inputs)
+    extra = model._last_extra_position_metrics
+    assert extra["backbone_loss_pp"].shape == result[2].shape
+    # The shifted layout keeps backbone logits at position 0, so both branches
+    # must score the same anchor with the same sampled anchors and weights.
     torch.testing.assert_close(
-        backbone[2], expected_per_position, rtol=2e-5, atol=2e-6
+        result[2][0], extra["backbone_loss_pp"][0], rtol=1e-6, atol=1e-6
     )
-    assert not torch.equal(corrected[2], backbone[2])
+    torch.testing.assert_close(
+        result[3][0], extra["backbone_acc_pp"][0], rtol=1e-6, atol=1e-6
+    )
 
 
 def test_two_row_layout_matches_reference_and_backward():

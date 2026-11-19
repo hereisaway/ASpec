@@ -48,9 +48,10 @@ class DominoModel(DFlashModel):
         # anchor slot. Both match the two documented Domino layouts.
         self.label_start = 1 if self.draft_model.shift_label else 0
         self.prediction_start = 1 - self.label_start
-        # Held-out evaluation can report the backbone-only branch without
-        # changing the mixed objective used for training.
-        self.report_backbone = False
+        # Held-out evaluation can collect backbone-only per-position metrics
+        # from the same forward and anchors as the corrected branch.
+        self.collect_extra_position_metrics = False
+        self._last_backbone_report = None
         self.set_lambda_base(lambda_base)
 
     def _prepare_draft_prefix(
@@ -146,12 +147,41 @@ class DominoModel(DFlashModel):
             "backbone_ce": base_per_token.detach(),
             "corrected_ce": corrected_per_token.detach(),
         }
-        # Report the corrected objective's per-position value by default;
-        # accuracy uses the corrected logits as well. Held-out backbone-only
-        # evaluation flips the reporting branch without changing the mixed loss.
-        if self.report_backbone:
-            return loss_per_token, base_per_token, base_logits
+        if self.collect_extra_position_metrics:
+            # Keep the same-forward backbone values for evaluation; the mixed
+            # loss and corrected reporting branch are unchanged.
+            self._last_backbone_report = (base_per_token.detach(), base_logits.detach())
+        # Report the corrected objective's per-position value; accuracy uses the
+        # corrected logits as well.
         return loss_per_token, corrected_per_token, corrected_logits
+
+    def _extra_position_metrics(
+        self,
+        *,
+        bsz,
+        n_blocks,
+        target_ids,
+        binary_weights,
+        count_per_position,
+    ):
+        if not self.collect_extra_position_metrics or self._last_backbone_report is None:
+            return {}
+        base_per_token, base_logits = self._last_backbone_report
+        block_size = self.block_size
+        base_loss_pp = base_per_token.reshape(bsz, n_blocks, block_size)
+        vocab_size = base_logits.size(-1)
+        base_pred = base_logits.reshape(-1, vocab_size).argmax(-1)
+        correct = (base_pred.view(bsz, n_blocks, block_size) == target_ids) & (
+            binary_weights > 0.5
+        )
+        safe_count = count_per_position.clamp(min=1.0)
+        loss_pp = (base_loss_pp * binary_weights).sum(dim=(0, 1)) / safe_count
+        acc_pp = correct.float().sum(dim=(0, 1)) / safe_count
+        return {
+            "backbone_loss_pp": loss_pp.detach(),
+            "backbone_acc_pp": acc_pp.detach(),
+            "backbone_count_pp": count_per_position.detach(),
+        }
 
     def _extra_training_loss(
         self,

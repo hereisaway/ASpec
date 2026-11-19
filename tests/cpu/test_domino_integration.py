@@ -25,6 +25,7 @@ from aspec.training.checkpoint import (
     _logical_training_topology,
     _validate_exact_resume_topology,
 )
+from aspec.training.dflash_trainer import DFlashTrainer
 from aspec.training.domino_trainer import DominoTrainer
 from aspec.training.trainer_actor import _trainer_class_for_config
 
@@ -218,49 +219,74 @@ def test_plan_rejects_invalid_domino_lambda_curriculum(tmp_path, overrides):
         compile_execution_plan(config, config_path=str(_EXAMPLE), cli_args=args)
 
 
-def test_lambda_curriculum_matches_reference_linear_decay():
+def test_lambda_curriculum_matches_reference_microbatch_counter():
     trainer = object.__new__(DominoTrainer)
     trainer.lambda_base = 0.3
     trainer.lambda_base_start = 1.0
     trainer.lambda_base_decay_ratio = 1.0
     trainer.lambda_total_steps = 8
-    assert trainer._lambda_base_for_step(0) == pytest.approx(1.0)
-    assert trainer._lambda_base_for_step(2) == pytest.approx(0.75)
-    assert trainer._lambda_base_for_step(4) == pytest.approx(0.5)
-    assert trainer._lambda_base_for_step(8) == pytest.approx(0.0)
-    assert trainer._lambda_base_for_step(99) == pytest.approx(0.0)
+    assert trainer._lambda_base_for_micro_step(1) == pytest.approx(0.875)
+    assert trainer._lambda_base_for_micro_step(2) == pytest.approx(0.75)
+    assert trainer._lambda_base_for_micro_step(4) == pytest.approx(0.5)
+    assert trainer._lambda_base_for_micro_step(8) == pytest.approx(0.0)
+    assert trainer._lambda_base_for_micro_step(99) == pytest.approx(0.0)
 
     trainer.lambda_base_start = None
     trainer.lambda_base_decay_ratio = None
-    assert trainer._lambda_base_for_step(4) == pytest.approx(0.3)
+    assert trainer._lambda_base_for_micro_step(4) == pytest.approx(0.3)
 
 
-def test_backbone_eval_metrics_merge_with_prefix():
-    corrected = {
-        "eval/ploss_0": 1.0,
-        "eval/acc_0": 0.5,
-        "eval/avg_loss": 2.0,
-        "eval/avg_acc": 0.25,
-        "eval/mixed_ce": 2.0,
-        "eval/backbone_ce": 3.0,
+def test_training_loop_advances_lambda_per_microbatch(monkeypatch):
+    trainer = object.__new__(DominoTrainer)
+    trainer.global_step = 0
+    trainer.lambda_base = 0.3
+    trainer.lambda_base_start = 1.0
+    trainer.lambda_base_decay_ratio = 1.0
+    trainer.lambda_total_steps = 8
+    trainer.args = SimpleNamespace(draft_accumulation_steps=2)
+    captured = []
+    trainer.dflash = SimpleNamespace(set_lambda_base=captured.append)
+    monkeypatch.setattr(DFlashTrainer, "_train_step", lambda self, **kwargs: {})
+
+    trainer._train_step(
+        batch=None, accumulation_steps=2, step=1, batch_idx=0, num_batches=2
+    )
+    trainer._train_step(
+        batch=None, accumulation_steps=2, step=1, batch_idx=1, num_batches=2
+    )
+    assert captured == pytest.approx([0.875, 0.75])
+
+
+def test_backbone_eval_metrics_aggregate_per_position(monkeypatch):
+    import aspec.training.dflash_trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer_module.dist, "get_rank", lambda: 1)
+    trainer = object.__new__(DominoTrainer)
+    trainer._anchor_slot_offset = 0
+    trainer.global_step = 4
+    trainer.optimizer = SimpleNamespace(get_learning_rate=lambda: 0.0)
+    trainer.dflash = SimpleNamespace(
+        mtp_conditioning=None, collect_extra_position_metrics=False
+    )
+    trainer.draft_model = SimpleNamespace(config=SimpleNamespace())
+    trainer.loss_decay_gamma = 0.0
+    trainer.args = SimpleNamespace(draft_accumulation_steps=2)
+    step = {
+        "loss_pp": torch.tensor([1.0]),
+        "acc_pp": torch.tensor([1.0]),
+        "count_pp": torch.tensor([1.0]),
+        "backbone_loss_pp": torch.tensor([2.0]),
+        "backbone_acc_pp": torch.tensor([0.5]),
+        "backbone_count_pp": torch.tensor([1.0]),
+        "mixed_ce": (torch.tensor(2.0), torch.tensor(1.0)),
     }
-    backbone = {
-        "eval/ploss_0": 9.0,
-        "eval/acc_0": 0.1,
-        "eval/avg_loss": 8.0,
-        "eval/avg_acc": 0.2,
-        "eval/simulated_acc_len": 0.3,
-        "eval/mixed_ce": 2.0,
-    }
-    merged = DominoTrainer._merge_backbone_eval_metrics(corrected, backbone)
-    assert merged["eval/ploss_0"] == 1.0
-    assert merged["eval/backbone_ploss_0"] == 9.0
-    assert merged["eval/backbone_acc_0"] == 0.1
-    assert merged["eval/backbone_avg_loss"] == 8.0
-    assert merged["eval/backbone_avg_acc"] == 0.2
-    assert merged["eval/backbone_simulated_acc_len"] == 0.3
-    assert merged["eval/mixed_ce"] == 2.0
-    assert "eval/backbone_mixed_ce" not in merged
+    metrics = trainer._aggregate_eval_metrics([step])
+    assert metrics["eval/backbone_ploss_0"] == pytest.approx(2.0)
+    assert metrics["eval/backbone_acc_0"] == pytest.approx(0.5)
+    assert metrics["eval/backbone_avg_loss"] == pytest.approx(2.0)
+    assert metrics["eval/backbone_avg_acc"] == pytest.approx(0.5)
+    assert metrics["eval/backbone_simulated_acc_len"] == pytest.approx(0.5)
 
 
 def test_plan_rejects_explicit_cudnn_gqa_mode(tmp_path):

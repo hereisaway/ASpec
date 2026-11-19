@@ -479,6 +479,8 @@ class DFlashModel(nn.Module):
             return self.draft_model.lm_head(draft_hidden)
         return F.linear(draft_hidden, lm_head_weight)
 
+    collect_extra_position_metrics = False
+
     def _extra_training_loss(
         self,
         draft_hidden: torch.Tensor,
@@ -487,6 +489,18 @@ class DFlashModel(nn.Module):
         objective_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
         return logits.new_zeros(()), {}
+
+    def _extra_position_metrics(
+        self,
+        *,
+        bsz: int,
+        n_blocks: int,
+        target_ids: torch.Tensor,
+        binary_weights: torch.Tensor,
+        count_per_position: torch.Tensor,
+    ) -> dict:
+        """Algorithm-specific additional per-position metrics for evaluation."""
+        return {}
 
     def _training_loss(
         self,
@@ -1367,6 +1381,17 @@ class DFlashModel(nn.Module):
             acc_per_position = (correct.view(bsz, n_blocks, self.block_size).float()).sum(
                 dim=(0, 1)
             ) / count_per_pos
+
+        if self.collect_extra_position_metrics:
+            self._last_extra_position_metrics = self._extra_position_metrics(
+                bsz=bsz,
+                n_blocks=n_blocks,
+                target_ids=target_ids,
+                binary_weights=binary_weights,
+                count_per_position=count_per_position,
+            )
+        else:
+            self._last_extra_position_metrics = {}
 
         return (
             loss,

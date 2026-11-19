@@ -562,11 +562,15 @@ class DFlashTrainer(Trainer):
                 loss_components,
                 _,
             ) = self._forward(batch)
+        extra_position_metrics = getattr(
+            self.dflash, "_last_extra_position_metrics", {}
+        ) or {}
         return {
             "loss_pp": loss_per_position.detach(),
             "acc_pp": acc_per_position.detach(),
             "count_pp": count_per_position.detach(),
             **loss_components,
+            **extra_position_metrics,
         }
 
     def _reduce_position_metrics(
