@@ -24,6 +24,7 @@ from aspec.training.checkpoint import (
     _logical_training_topology,
     _validate_exact_resume_topology,
 )
+from aspec.training.dflash_trainer import DFlashTrainer
 from aspec.training.jetspec_trainer import JetSpecTrainer
 from aspec.training.trainer_actor import _trainer_class_for_config
 
@@ -156,29 +157,42 @@ def _trainer_args():
     )
 
 
-def test_trainer_builds_jetspec_wrapper_and_pins_block_size():
-    trainer = object.__new__(JetSpecTrainer)
-    trainer.block_size = 5
-    trainer.num_anchors = 2
-    trainer.num_target_layers = 1
-    trainer.loss_objective = "decay"
-    trainer.dpace_alpha = 0.5
-    trainer.loss_decay_gamma = 0.0
-    trainer.ce_loss_alpha = 0.0
-    trainer.l1_loss_alpha = 0.0
-    trainer.distillation_temperature = 1.0
-    trainer.kl_chunk_rows = 64
-    trainer.args = SimpleNamespace(
-        deterministic_anchor_sampling=False, seed=42, anchor_sampling_scope="row",
-        attention_backend="flex_attention", draft_context_parallel_size=1,
-    )
+def test_trainer_constructor_propagates_jetspec_objective(
+    monkeypatch,
+):
+    def base_init(self, args):
+        self.args = args
+        self.block_size = args.dflash_block_size
+        self.num_anchors = args.dflash_num_anchors
+        self.num_target_layers = args.dflash_num_target_layers
+        self.loss_objective = args.dflash_loss_objective
+        self.dpace_alpha = args.dflash_dpace_alpha
+        self.loss_decay_gamma = args.dflash_loss_decay_gamma
+        self.ce_loss_alpha = args.dflash_ce_loss_alpha
+        self.l1_loss_alpha = args.dflash_l1_loss_alpha
+        self._anchor_slot_offset = 1
+
+    monkeypatch.setattr(DFlashTrainer, "__init__", base_init)
+    args = _trainer_args()
+    args.jetspec_distillation_temperature = 0.5
+    args.jetspec_kl_chunk_rows = 32
+    args.jetspec_loss_decay_gamma = 0.25
+    trainer = JetSpecTrainer(args)
+
+    assert trainer.loss_decay_gamma == 0.25
+    assert trainer.loss_decay_gamma != args.dflash_loss_decay_gamma
     wrapper = trainer._build_training_wrapper(JetSpecDraftModel(_tiny_config()))
     assert isinstance(wrapper, JetSpecModel)
-    assert wrapper.distillation_temperature == 1.0
-    assert wrapper.kl_chunk_rows == 64
-    assert wrapper.loss_decay_gamma == 0.0
+    assert wrapper.distillation_temperature == 0.5
+    assert wrapper.kl_chunk_rows == 32
+    assert wrapper.loss_decay_gamma == 0.25
     assert wrapper.prediction_start == 1
     assert trainer._anchor_slot_offset == 1
+
+    objective = _logical_training_topology(args, 2)["training_objective"]
+    assert objective["distillation_temperature"] == wrapper.distillation_temperature
+    assert objective["kl_chunk_rows"] == wrapper.kl_chunk_rows
+    assert objective["loss_decay_gamma"] == wrapper.loss_decay_gamma
 
     trainer.block_size = 4
     with pytest.raises(ValueError, match="block_size"):
