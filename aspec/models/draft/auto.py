@@ -28,6 +28,7 @@ from aspec.config.eagle4 import Eagle4Config
 from aspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
 from aspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from aspec.models.draft.dflash2 import DFlash2Config, DFlash2DraftModel
+from aspec.models.draft.domino import DominoConfig, DominoDraftModel
 from aspec.models.draft.dspark import (
     DSparkConfig,
     DSparkDraftModel,
@@ -48,6 +49,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         DeepseekV3Config: Eagle3DeepseekV2ForCausalLM,
         NativeMTPConfig: NativeMTPDraftModel,
         MedusaConfig: MedusaDraftModel,
+        DominoConfig: DominoDraftModel,
         DFlashConfig: DFlashDraftModel,
         DFlash2Config: DFlash2DraftModel,
         DSparkConfig: DSparkDraftModel,
@@ -71,6 +73,7 @@ class AutoDraftModelConfig:
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
         "NativeMTPDraftModel": NativeMTPConfig,
         "MedusaDraftModel": MedusaConfig,
+        "DominoDraftModel": DominoConfig,
         "DFlashDraftModel": DFlashConfig,
         "DFlash2DraftModel": DFlash2Config,
         "Qwen3DSparkModel": DSparkConfig,

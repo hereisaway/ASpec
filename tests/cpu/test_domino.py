@@ -153,7 +153,18 @@ def reference_objective(model, draft_hidden, inputs):
     per_position = (
         corrected_ce.reshape(-1, anchors.shape[1], block_size) * weights
     ).sum(dim=(0, 1)) / count.clamp(min=1.0)
-    return loss, corrected_ce.reshape(-1, anchors.shape[1], block_size), per_position
+    denominator = flat_weights.sum().clamp_min(1e-6)
+    components = {
+        "mixed_ce": ((mixed * flat_weights).sum(), denominator),
+        "backbone_ce": ((base_ce * flat_weights).sum(), denominator),
+        "corrected_ce": ((corrected_ce * flat_weights).sum(), denominator),
+    }
+    return (
+        loss,
+        corrected_ce.reshape(-1, anchors.shape[1], block_size),
+        per_position,
+        components,
+    )
 
 
 def _assert_parameter_gradients(actual, expected):
@@ -239,10 +250,10 @@ def test_loss_and_gradients_match_independent_equations(
 
     result, captured = run_and_capture(actual, inputs)
     _, reference_captured = run_and_capture(reference, reference_inputs)
-    expected_loss, expected_ce, expected_per_position = reference_objective(
+    expected_loss, expected_ce, expected_per_position, _ = reference_objective(
         reference, reference_captured, reference_inputs
     )
-    actual_loss, actual_ce, actual_per_position = reference_objective(
+    actual_loss, actual_ce, actual_per_position, _ = reference_objective(
         actual, captured, inputs
     )
 
@@ -261,7 +272,7 @@ def test_lambda_one_recovers_the_backbone_only_objective():
     model = make_model(lambda_base=1.0, loss_decay_gamma=0.0)
     inputs = make_inputs()
     result, captured = run_and_capture(model, inputs)
-    expected, _, _ = reference_objective(model, captured, inputs)
+    expected, _, _, _ = reference_objective(model, captured, inputs)
     torch.testing.assert_close(result[0], expected, rtol=2e-5, atol=2e-6)
     result[0].backward()
     for parameter in (
@@ -279,10 +290,10 @@ def test_two_row_layout_matches_reference_and_backward():
     inputs, reference_inputs = make_inputs(batch=2), make_inputs(batch=2)
     result, captured = run_and_capture(actual, inputs)
     _, reference_captured = run_and_capture(reference, reference_inputs)
-    expected_loss, expected_ce, _ = reference_objective(
+    expected_loss, expected_ce, _, _ = reference_objective(
         reference, reference_captured, reference_inputs
     )
-    actual_loss, actual_ce, _ = reference_objective(actual, captured, inputs)
+    actual_loss, actual_ce, _, _ = reference_objective(actual, captured, inputs)
     assert result[0].ndim == 0
     torch.testing.assert_close(result[0], expected_loss, rtol=2e-5, atol=2e-6)
     torch.testing.assert_close(actual_loss, expected_loss, rtol=2e-5, atol=2e-6)
@@ -297,7 +308,7 @@ def test_loss_mask_excludes_unsupervised_labels():
     inputs = make_inputs()
     inputs["loss_mask"][0, 6] = 0
     result, captured = run_and_capture(model, inputs)
-    expected, _, _ = reference_objective(model, captured, inputs)
+    expected, _, _, _ = reference_objective(model, captured, inputs)
     torch.testing.assert_close(result[0], expected, rtol=2e-5, atol=2e-6)
     offsets = torch.arange(model.label_start, model.label_start + model.block_size)
     label_indices = inputs["injected_anchors"].unsqueeze(-1) + offsets
@@ -340,7 +351,7 @@ def test_short_sequences_keep_loss_finite(length):
     inputs = make_inputs(length=length)
     inputs["injected_anchors"] = torch.tensor([[0, max(length - 3, 1)]])
     result, captured = run_and_capture(model, inputs)
-    expected, _, _ = reference_objective(model, captured, inputs)
+    expected, _, _, _ = reference_objective(model, captured, inputs)
     torch.testing.assert_close(result[0], expected, rtol=2e-5, atol=2e-6)
     assert torch.isfinite(result[0])
     result[0].backward()
@@ -461,13 +472,16 @@ def _plain_dflash_with_domino_backbone(domino):
     }
     plain_draft.load_state_dict(backbone, strict=True)
     plain_draft.embed_tokens.requires_grad_(False)
-    return DFlashModel(
+    plain = DFlashModel(
         plain_draft,
         block_size=domino.block_size,
         num_anchors=domino.num_anchors,
         attention_backend="sdpa",
         loss_decay_gamma=domino.loss_decay_gamma,
     )
+    # Compare the objective on the same block-isolated backbone visibility.
+    plain._materialize_cpu_block_mask = True
+    return plain
 
 
 @pytest.mark.parametrize(
@@ -511,6 +525,76 @@ def test_unshifted_lambda_one_matches_plain_dflash_loss_and_gradients():
     ):
         grad = domino_parameters[name].grad
         assert grad is None or torch.count_nonzero(grad) == 0, name
+
+
+def test_draft_forward_keeps_existing_positional_arguments():
+    import inspect
+
+    from aspec.models.draft.dflash import DFlashDraftModel
+
+    parameters = inspect.signature(DFlashDraftModel.forward).parameters
+    assert parameters["draft_attention_mask"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert (
+        parameters["return_router_logits"].kind
+        is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+
+
+def test_cpu_backbone_blocks_hide_later_target_features():
+    model = make_model()
+    inputs = make_inputs()
+    inputs["injected_anchors"] = torch.tensor([[2, 7]])
+    _, base_hidden = run_and_capture(model, inputs)
+    changed = {key: value.clone() if torch.is_tensor(value) else value
+               for key, value in inputs.items()}
+    # Block 0 (anchor 2) only sees context positions 0..1; position 2 is the
+    # strict cutoff, and later Target features belong to block 1's context.
+    changed["hidden_states_list"][0, 2:] += 5.0
+    _, moved_hidden = run_and_capture(model, changed)
+    base_blocks = base_hidden.reshape(1, 2, 5, -1)
+    moved_blocks = moved_hidden.reshape(1, 2, 5, -1)
+    torch.testing.assert_close(base_blocks[:, 0], moved_blocks[:, 0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        F.linear(base_blocks[:, 0], inputs["lm_head_weight"]),
+        F.linear(moved_blocks[:, 0], inputs["lm_head_weight"]),
+        rtol=0, atol=0,
+    )
+    assert not torch.equal(base_blocks[:, 1], moved_blocks[:, 1])
+
+
+def test_cpu_draft_blocks_do_not_read_each_others_keys():
+    model = make_model()
+    inputs = make_inputs()
+    inputs["injected_anchors"] = torch.tensor([[2, 7]])
+    _, base_hidden = run_and_capture(model, inputs)
+    changed = {key: value.clone() if torch.is_tensor(value) else value
+               for key, value in inputs.items()}
+    changed["input_ids"][0, 2] = (changed["input_ids"][0, 2] + 1) % 32
+    _, moved_hidden = run_and_capture(model, changed)
+    base_blocks = base_hidden.reshape(1, 2, 5, -1)
+    moved_blocks = moved_hidden.reshape(1, 2, 5, -1)
+    assert not torch.equal(base_blocks[:, 0], moved_blocks[:, 0])
+    torch.testing.assert_close(base_blocks[:, 1], moved_blocks[:, 1], rtol=0, atol=0)
+
+
+def test_loss_components_report_additive_pairs():
+    model = make_model(lambda_base=0.3, loss_decay_gamma=3.0)
+    inputs = make_inputs()
+    inputs["loss_mask"][0, 9] = 0
+    result, captured = run_and_capture(model, inputs)
+    _, _, _, expected = reference_objective(model, captured, inputs)
+    actual = result[5]
+    assert set(expected) <= set(actual)
+    for name, pair in expected.items():
+        torch.testing.assert_close(actual[name][0], pair[0], rtol=2e-5, atol=2e-6)
+        torch.testing.assert_close(actual[name][1], pair[1], rtol=2e-5, atol=2e-6)
+
+    mixed = (actual["mixed_ce"][0] / actual["mixed_ce"][1]).item()
+    backbone = (actual["backbone_ce"][0] / actual["backbone_ce"][1]).item()
+    corrected = (actual["corrected_ce"][0] / actual["corrected_ce"][1]).item()
+    assert mixed == pytest.approx(float(result[0].detach()), rel=1e-5, abs=1e-6)
+    assert mixed != pytest.approx(backbone, rel=1e-5, abs=1e-6)
+    assert corrected != pytest.approx(mixed, rel=1e-5, abs=1e-6)
 
 
 def test_correction_ignores_future_block_tokens():

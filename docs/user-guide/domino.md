@@ -1,10 +1,80 @@
-# Domino model and loss core
+# Domino Draft training
 
-This is the first prerequisite for [ASpec #38](https://github.com/inclusionAI/ASpec/issues/38).
-It provides `aspec.models.draft.domino.DominoDraftModel` and
+This implements [ASpec #38](https://github.com/inclusionAI/ASpec/issues/38) through
+`aspec.models.draft.domino.DominoDraftModel` and
 `aspec.models.domino.DominoModel`: a block-parallel DFlash backbone with a
-GRU-conditioned causal correction head. It is a model/loss API; the ASpec training
-CLI does not select this algorithm yet.
+GRU-conditioned causal correction head. The ASpec training CLI now selects this
+algorithm through `aspec/config/domino_qwen3_8b_draft_config.json`; the
+[example workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) runs one
+Target GPU plus two Draft GPUs at 4K (three GPUs total).
+
+## Training selection
+
+- Draft config: `aspec/config/domino_qwen3_8b_draft_config.json` (Qwen3-8B,
+  `block_size=16`, `shift_label=true`, `pure_draft_prefix_len=1`).
+- Example: `configs/examples/domino_qwen3_8b_4k_tcp.yaml` (FlexAttention, CP1, MBS1,
+  non-packing, REPLICATE, Store/TCP transport).
+- The trainer owns a fixed per-run `training.domino_lambda_base`; the curriculum
+  schedule is not implemented yet. Exact recovery records `lambda_base`, the label
+  layout and the correction-head dimensions.
+- The supported path fails closed outside dense full attention, padded inputs,
+  `attention_backend=flex_attention`, `draft_context_parallel_size=1` and
+  `dflash_packing=false`. The CUDA FlexAttention mask and the CPU dense fallback
+  share the same block visibility; the CPU mask is built for contract tests only. MoE, sparse attention, MTP conditioning, packing, CP>1
+  and whole-model compile are rejected during Plan compilation or configuration.
+
+## Running
+
+Prepare the Target in a separate environment and keep it running on GPU 0:
+
+```bash
+aspec patch-sglang
+CUDA_VISIBLE_DEVICES=0 aspec target \
+  --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B
+```
+
+Compile the example, then train with two Draft GPUs (GPUs 1 and 2):
+
+```bash
+aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml --dry-run \
+  model.target_model_path=/path/to/Qwen3-8B
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B
+```
+
+For exact recovery, stop the first run at step 4 while keeping `lr_total_steps=8`,
+then resume that checkpoint into a fresh directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B \
+  training.num_train_steps=4 training.lr_total_steps=8 \
+  output_dir=outputs/domino_qwen3_8b_4k_tcp_step4
+
+CUDA_VISIBLE_DEVICES=1,2 RAY_ADDRESS=local \
+  aspec --config configs/examples/domino_qwen3_8b_4k_tcp.yaml \
+  model.target_model_path=/path/to/Qwen3-8B \
+  training.load_path=outputs/domino_qwen3_8b_4k_tcp_step4/checkpoints \
+  training.num_train_steps=8 training.lr_total_steps=8 \
+  training.continual_training=false \
+  output_dir=outputs/domino_qwen3_8b_4k_tcp_resumed
+```
+
+The example is a short functional smoke-test recipe, not evidence that GPU execution
+has been validated. Only CPU and Plan checks have been reported; the GPU run remains
+pending. It uses the bundled conversations and a short step budget, not convergence,
+throughput or decoding acceptance. Supply licensed data and a full learning-rate
+horizon for a real run.
+
+## Validation status
+
+Plan compilation, registration, trainer construction, checkpoint topology and the
+CPU numerical contracts are covered by `tests/cpu`. The public CI lane is CPU-only;
+GPU end-to-end training and exact resume still need a hardware run before claiming
+throughput or quality.
 
 ## Reference and selected scope
 
@@ -73,7 +143,9 @@ only for the unshifted layout (`shift_label=false`) with otherwise matching
 weighting settings; the shifted layout supervises different slots. Anchor sampling,
 block masks, label bounds, `loss_mask` and DFlash-style exponential depth decay are
 reused; `ce_loss_alpha=1` and `l1_loss_alpha=0` are enforced. Reporting accuracy and per-position loss use the
-corrected logits, while the returned loss applies the DFlash objective weights.
+corrected logits. The trainer reports `mixed_ce` as `train/avg_loss`/`eval/avg_loss`
+(the objective actually used for backward) and exposes `mixed_ce`, `backbone_ce` and
+`corrected_ce` as separate token-pooled component curves.
 
 ## Minimal numerical use
 
@@ -117,8 +189,7 @@ handling, empty supervision, and frozen Target/embedding behavior.
 
 ## Remaining work
 
-Trainer/Plan selection, the `lambda_base` curriculum schedule, a runnable recipe,
-exact resume of backbone/head/curriculum state, native export with strict reloading,
-Target bindings, proposal consumers and held-out backbone-vs-corrected observations
-remain pending. CPU numerical checks do not establish Qwen3-8B training quality,
-GPU throughput or decoding acceptance.
+The `lambda_base` curriculum schedule, a maintained recipe catalog entry, native
+export with strict reloading, Target bindings, proposal consumers and held-out
+backbone-vs-corrected observations remain pending. CPU numerical and Plan checks do
+not establish Qwen3-8B training quality, GPU throughput or decoding acceptance.

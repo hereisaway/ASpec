@@ -441,7 +441,6 @@ class DFlashAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
-        draft_attention_mask=None,
         direct_cp_metadata=None,
         csa_metadata=None,
         csa_prepared=None,
@@ -450,6 +449,8 @@ class DFlashAttention(nn.Module):
         qsa_layout=None,
         dsa_metadata=None,
         dsa_layout=None,
+        *,
+        draft_attention_mask=None,
     ) -> torch.Tensor:
         """Forward pass with dual-source KV.
 
@@ -459,8 +460,8 @@ class DFlashAttention(nn.Module):
             draft_position_ids: [B, draft_len] — position IDs for draft tokens
             context_position_ids: [B, ctx_len] — position IDs for context tokens
             block_mask: FlexAttention BlockMask for block-causal attention
-            draft_attention_mask: Boolean [B, draft_len, ctx_len+draft_len] mask
-                for the non-FlexAttention fallback (for example CPU tests).
+            draft_attention_mask: Boolean [B, draft_len, ctx_len+draft_len]
+                mask for the non-FlexAttention fallback (for example CPU tests).
         """
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -1027,7 +1028,6 @@ class DFlashDecoderLayer(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
-        draft_attention_mask=None,
         direct_cp_metadata=None,
         csa_metadata=None,
         csa_prepared=None,
@@ -1036,6 +1036,8 @@ class DFlashDecoderLayer(nn.Module):
         qsa_layout=None,
         dsa_metadata=None,
         dsa_layout=None,
+        *,
+        draft_attention_mask=None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -1322,12 +1324,13 @@ class DFlashDraftModel(PreTrainedModel):
         context_position_ids: torch.Tensor,
         block_mask=None,
         noise_embedding: Optional[torch.Tensor] = None,
-        draft_attention_mask=None,
         direct_cp_metadata=None,
         csa_metadata=None,
         qsa_metadata=None,
         dsa_metadata=None,
         return_router_logits: bool = False,
+        *,
+        draft_attention_mask=None,
     ) -> torch.Tensor:
         """Forward pass through draft model.
 

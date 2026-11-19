@@ -77,7 +77,7 @@ def _logical_training_topology(args: Any, world_size: int) -> dict[str, Any]:
             key: getattr(args, key, None)
             for key in ("ttt_length", "loss_type", "lk_eta", "ploss_weights")
         }
-    elif getattr(args, "draft_algorithm", None) in {"dflash", "dflash2", "dspark"}:
+    elif getattr(args, "draft_algorithm", None) in {"dflash", "dflash2", "dspark", "domino"}:
         topology["training_objective"] = {
             "block_size": int(args.dflash_block_size),
             "anchor_sampling_scope": getattr(args, "anchor_sampling_scope", "row"),
@@ -92,6 +92,8 @@ def _logical_training_topology(args: Any, world_size: int) -> dict[str, Any]:
                 for name, default in (("temperature", 1.0), ("top_p", 1.0), ("top_k", -1)):
                     key = f"l1_{side}_{name}"
                     topology["training_objective"][key] = getattr(args, f"dspark_{key}", default)
+        elif args.draft_algorithm == "domino":
+            fields += ("loss_objective",)
         else:
             fields += ("loss_objective", "dpace_alpha")
         for name in fields:
@@ -101,6 +103,11 @@ def _logical_training_topology(args: Any, world_size: int) -> dict[str, Any]:
         if args.draft_algorithm == "dflash2":
             topology["training_objective"]["selector_loss_alpha"] = args.dflash2_selector_loss_alpha
             topology["training_objective"]["selector_objective"] = "experimental_teacher_forced_topk_ce"
+        if args.draft_algorithm == "domino":
+            topology["training_objective"]["loss"] = "mixed_corrected_backbone_ce"
+            topology["training_objective"]["lambda_base"] = getattr(
+                args, "domino_lambda_base", 0.3
+            )
     if "training_objective" in topology:
         fields = ("max_seq_length", "micro_batch_size", "draft_accumulation_steps",
                   "max_grad_norm", "seed")
@@ -163,7 +170,7 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
                     raise RuntimeError(f"Exact resume cannot change dspark_{key}; use weights-only initialization")
     # Checkpoints predating this option always sampled per physical row.
     # Missing semantic identity must not authorize a switch to per-sample training.
-    if (getattr(args, "draft_algorithm", None) in {"dspark", "dflash", "dflash2"}
+    if (getattr(args, "draft_algorithm", None) in {"dspark", "dflash", "dflash2", "domino"}
             and ((saved_topology or {}).get("training_objective") or {}).get(
                 "anchor_sampling_scope", "row"
             ) != getattr(args, "anchor_sampling_scope", "row")):
@@ -195,10 +202,32 @@ def _validate_exact_resume_topology(args: Any, metadata: dict[str, Any], *, chec
     ):
         raise RuntimeError("Exact resume cannot change a legacy full-attention checkpoint to SWA")
     if saved_topology is None:
+        if getattr(args, "draft_algorithm", None) == "domino":
+            raise RuntimeError(
+                "Exact resume requires training_topology for Domino checkpoints; "
+                "use continual_training=true for a weights-only new stage."
+            )
         # Older complete checkpoints recorded world_size only.  Preserve that
         # compatibility while every newly published checkpoint records the
         # full logical parallelism contract below.
         return
+    if getattr(args, "draft_algorithm", None) == "domino":
+        objective = saved_topology.get("training_objective") or {}
+        semantics = saved_topology.get("draft_model_semantics") or {}
+        missing = [
+            key for key in ("lambda_base", "block_size", "loss", "loss_decay_gamma")
+            if key not in objective
+        ]
+        missing += [
+            key for key in ("shift_label", "pure_draft_prefix_len")
+            if key not in semantics
+        ]
+        if missing:
+            raise RuntimeError(
+                "Exact resume requires complete Domino training_topology; "
+                f"missing {missing}. Use continual_training=true for a "
+                "weights-only new stage."
+            )
     if current_policy.get("dsa") is not None:
         # Chunk workspace is an execution bound, not the DSA objective. Preserve
         # every recorded semantic field while allowing a different memory budget.

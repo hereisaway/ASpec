@@ -441,6 +441,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         context_position_ids: torch.Tensor,
         block_mask=None,
         direct_cp_metadata=None,
+        *,
+        draft_attention_mask=None,
         **kwargs,
     ) -> torch.Tensor:
         residual = draft_hidden
@@ -452,6 +454,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            draft_attention_mask=draft_attention_mask,
             direct_cp_metadata=direct_cp_metadata,
         )
         draft_hidden = self.attention_conv.finish(draft_hidden, attention_kernel)

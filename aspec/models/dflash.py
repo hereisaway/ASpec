@@ -191,6 +191,8 @@ class DFlashModel(nn.Module):
     # First label offset relative to an anchor. Base DFlash predicts the token at
     # the anchor itself (masked out); shifted-layout variants start at anchor + 1.
     label_start = 0
+    # CPU fallback materializes the block mask only for wrappers that opt in.
+    _materialize_cpu_block_mask = False
 
     def __init__(
         self,
@@ -878,24 +880,28 @@ class DFlashModel(nn.Module):
             for layer_id in range(self.draft_model.num_layers):
                 options = self._block_mask_options_for_layer(layer_id)
                 causal = bool(options.get("is_causal", False))
-                if causal and set(options) - {"is_causal"}:
+                materialize = causal or self._materialize_cpu_block_mask
+                if materialize and set(options) - {"is_causal"}:
                     raise ValueError(
-                        "CPU causal Draft attention does not implement these mask options"
+                        "CPU Draft attention does not implement these mask options"
                     )
-                if causal and ctx_doc_ids is not None:
+                if materialize and ctx_doc_ids is not None:
                     raise ValueError(
-                        "CPU causal Draft attention does not support packed ctx_doc_ids"
+                        "CPU block-mask Draft attention does not support packed ctx_doc_ids"
                     )
-                if causal not in dense_cache:
-                    dense_cache[causal] = (
-                        _create_dflash_dense_mask(
-                            anchor_positions, block_keep_mask, seq_len,
-                            self.block_size, is_causal=True,
+                if materialize:
+                    if causal not in dense_cache:
+                        dense_cache[causal] = _create_dflash_dense_mask(
+                            anchor_positions,
+                            block_keep_mask,
+                            seq_len,
+                            self.block_size,
+                            is_causal=causal,
                         )
-                        if causal else None
-                    )
-                dense_masks.append(dense_cache[causal])
-            if True in dense_cache:
+                    dense_masks.append(dense_cache[causal])
+                else:
+                    dense_masks.append(None)
+            if dense_cache:
                 dense_attention_masks = (
                     dense_masks[0] if len(dense_cache) == 1 else dense_masks
                 )
@@ -1026,8 +1032,8 @@ class DFlashModel(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
-            draft_attention_mask=dense_attention_masks,
             noise_embedding=noise_embedding,
+            draft_attention_mask=dense_attention_masks,
             direct_cp_metadata=direct_cp_metadata,
             csa_metadata=csa_metadata,
             qsa_metadata=qsa_metadata,
