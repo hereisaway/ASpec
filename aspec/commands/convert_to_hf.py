@@ -182,6 +182,12 @@ def _serving_config(raw_config: dict) -> dict:
 
     if raw_config.get("mtp_conditioning"):
         raise NotImplementedError("MTP-conditioned Drafts require native --format aspec export")
+    if raw_config.get("architectures") == ["DominoDraftModel"]:
+        raise NotImplementedError(
+            "Domino SGLang export is not validated in ASpec yet; use --format aspec. "
+            "Upstream SGLang 0.5.21 includes a Domino loader and an end-to-end test, "
+            "but ASpec has not validated its exported artifact against it"
+        )
 
     if raw_config.get("architectures") == ["MedusaDraftModel"]:
         raise NotImplementedError(
@@ -263,7 +269,7 @@ def _serving_config(raw_config: dict) -> dict:
 def _checkpoint_training_contract(model_dir: Path, raw_config: dict) -> dict:
     """Recover authoritative training identity from the checkpoint/run artifacts."""
     algorithm = resolve_draft_algorithm(raw_config)
-    family = "DSpark" if algorithm == "dspark" else "DFlash"
+    family = "DSpark" if algorithm == "dspark" else "Domino" if algorithm == "domino" else "DFlash"
     if algorithm == "dflash2":
         raw_config = AutoDraftModelConfig.from_dict(raw_config).to_dict()
     contract = {"algorithm": algorithm}
@@ -275,7 +281,7 @@ def _checkpoint_training_contract(model_dir: Path, raw_config: dict) -> dict:
             raise ValueError("Export algorithm conflicts with the checkpoint algorithm")
         if topology.get("training_objective") is not None:
             contract["objective"] = topology["training_objective"]
-            if algorithm in {"dspark", "dflash", "dflash2"} and "block_size" in contract["objective"]:
+            if algorithm in {"dspark", "dflash", "dflash2", "domino"} and "block_size" in contract["objective"]:
                 contract["block_size"] = contract["objective"]["block_size"]
         if algorithm == "eagle4":
             from aspec.config.eagle4 import eagle4_training_policy
@@ -298,7 +304,7 @@ def _checkpoint_training_contract(model_dir: Path, raw_config: dict) -> dict:
     # A real run's snapshot records block size even for legacy checkpoints whose
     # standalone model config did not persist the training-only field.
     checkpoint_dir = model_dir.parent
-    if algorithm in {"dspark", "dflash", "dflash2"} and checkpoint_dir.parent.name == "checkpoints":
+    if algorithm in {"dspark", "dflash", "dflash2", "domino"} and checkpoint_dir.parent.name == "checkpoints":
         snapshot = checkpoint_dir.parent.parent / "config.yaml"
         if snapshot.is_file():
             from omegaconf import OmegaConf
@@ -313,7 +319,7 @@ def _checkpoint_training_contract(model_dir: Path, raw_config: dict) -> dict:
             if declared is not None and declared != size:
                 raise ValueError("Export block_size conflicts with the training snapshot")
             contract["block_size"] = size
-    if algorithm in {"dspark", "dflash", "dflash2"}:
+    if algorithm in {"dspark", "dflash", "dflash2", "domino"}:
         size = contract.get("block_size", raw_config.get("block_size"))
         if size is not None:
             if type(size) is not int or size < 2:
@@ -383,6 +389,11 @@ def convert_checkpoint(
         raise ValueError("Export output directory must not overlap the source checkpoint or config")
 
     raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    nested = raw_config.get("dflash_config")
+    if isinstance(nested, dict) and nested.get("projector_type") == "domino":
+        from aspec.models.draft.domino import normalize_official_domino_config
+
+        raw_config = normalize_official_domino_config(raw_config)
     if artifact_format not in {"sglang", "aspec"}:
         raise ValueError("artifact_format must be sglang or aspec")
     if verify and artifact_format != "aspec":
@@ -509,8 +520,10 @@ def convert_checkpoint(
             manifest["draft_structure"]["attention"]["dsa"] = policy["dsa"]
         algorithm = training_contract["algorithm"]
         block_proposal = algorithm in {"dspark", "dflash"} and not raw_config.get("mtp_conditioning")
+        domino_proposal = algorithm == "domino" and not raw_config.get("mtp_conditioning")
         mla_proposal = raw_config.get("architectures") == ["Eagle3DeepseekV2ForCausalLM"]
         proposal = ("aspec.draft_artifact.MLAEagleConsumer" if mla_proposal else
+                    "aspec.draft_artifact.DominoConsumer" if domino_proposal else
                     "aspec.draft_artifact.BlockDraftConsumer" if block_proposal else None)
         manifest["draft_structure"]["loader_contract"] = {
             "runtime": "aspec", "entrypoint": "aspec.draft_artifact.load_native_draft",
@@ -522,7 +535,7 @@ def convert_checkpoint(
                 "heads-only asset; strict reload and per-head held-out metrics; "
                 "no candidate-tree acceptance" if algorithm == "medusa" else
                 "asset loading and weights-only warmstart; no native proposal component"),
-            "borrowed_tensors": ["Target output head"] if algorithm in {"dspark", "dflash"} else [],
+            "borrowed_tensors": (["Target output head"] if algorithm in {"dspark", "dflash", "domino"} else []),
         }
     (output_dir / "export_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",

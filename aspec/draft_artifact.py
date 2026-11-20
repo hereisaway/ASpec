@@ -244,6 +244,99 @@ class BlockDraftConsumer:
         return result
 
 
+class DominoConsumer:
+    """One Domino block from verifier features and its frozen output head.
+
+    The backbone stays block-parallel. Only the suffix is rolled out
+    sequentially through the GRU-conditioned correction head, matching the
+    published Domino inference path. The caller owns verification/acceptance.
+    """
+
+    def __init__(self, draft_model, *, block_size):
+        from aspec.models.dflash import DFlashModel
+
+        self.model = draft_model.eval()
+        self.algorithm = resolve_draft_algorithm(draft_model.config.to_dict())
+        if self.algorithm != "domino":
+            raise ValueError("DominoConsumer requires a Domino asset")
+        self.config = draft_model.config
+        if type(block_size) is not int or block_size < 2:
+            raise ValueError("block_size must be an integer >= 2")
+        if self.config.block_size != block_size:
+            raise ValueError("Proposal block size disagrees with the trained asset")
+        self.block_size = block_size
+        self.shift_label = bool(self.config.shift_label)
+        self.suffix_start = int(self.config.pure_draft_prefix_len)
+        if self.shift_label:
+            self.k_draft = block_size
+        else:
+            self.k_draft = block_size - 1
+        if not 0 <= self.suffix_start < self.k_draft:
+            raise ValueError("Domino prefix leaves no corrected position in the block")
+        backend = "fa4" if next(draft_model.parameters()).device.type == "cuda" else "sdpa"
+        self.backbone = DFlashModel(draft_model, block_size=block_size, num_anchors=1,
+                                   attention_backend=backend)
+        # Match Domino training on CPU: hide context rows at/after the anchor and
+        # other blocks with the same dense block mask instead of plain SDPA.
+        self.backbone._materialize_cpu_block_mask = True
+
+    @torch.no_grad()
+    def propose(self, input_ids, target_features, *, lm_head_weight):
+        """IDs/features describe one known prefix, including its last anchor token."""
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] < 1:
+            raise ValueError("Block proposal currently consumes one nonempty prefix")
+        length = input_ids.shape[1]
+        config = self.model.config
+        width = config.target_hidden_size * config.num_target_layers
+        if target_features.shape != (1, length, width):
+            raise ValueError("Target features must match the asset's ordered layers and prefix")
+        if lm_head_weight.shape != (config.vocab_size, config.hidden_size):
+            raise ValueError("Frozen Target output head shape does not match the Draft")
+        if input_ids.device != target_features.device or input_ids.device != lm_head_weight.device:
+            raise ValueError("Proposal IDs, features and output head must share a device")
+        if length + self.block_size - 1 > config.max_position_embeddings:
+            raise ValueError("Proposal exceeds the artifact's supported position range")
+
+        anchor = torch.tensor([[length - 1]], device=input_ids.device)
+        padded = F.pad(input_ids, (0, self.block_size), value=config.mask_token_id)
+        mask = torch.ones((1, length + self.block_size), device=input_ids.device)
+        if self.backbone.attention_backend == "fa4":
+            features = target_features
+            packed_positions = torch.arange(length, device=input_ids.device)[None]
+        else:
+            # The non-direct-CP context path expects one feature row per context
+            # token. Anchor visibility excludes these padded future rows.
+            features = F.pad(target_features, (0, 0, 0, self.block_size))
+            packed_positions = None
+        hidden = self.backbone._draft_backbone(
+            padded, features, mask,
+            packed_context_positions=packed_positions,
+            injected_anchors=anchor, injected_keep_mask=torch.ones_like(anchor, dtype=torch.bool),
+        )[0][0].unsqueeze(0)
+        if not self.shift_label:
+            hidden = hidden[:, 1:, :]
+        base_logits = F.linear(hidden, lm_head_weight)
+
+        prefix_ids = base_logits[:, : self.suffix_start].argmax(-1)
+        realized = torch.cat((input_ids[:, -1:], prefix_ids), dim=1)
+        prefix_embeds = self.model.embed_tokens(realized).to(self.model.prefix_gru.weight_ih_l0.dtype)
+        _, gru_hidden = self.model.prefix_gru(prefix_embeds)
+
+        tokens = [prefix_ids]
+        for position in range(self.suffix_start, self.k_draft):
+            z = hidden[:, position : position + 1, :]
+            state = gru_hidden.transpose(0, 1)
+            bias = self.model.embed_proj(torch.cat((z, state), dim=-1))
+            current = (base_logits[:, position : position + 1, :] + bias).argmax(-1)
+            tokens.append(current)
+            if position + 1 < self.k_draft:
+                new_embed = self.model.embed_tokens(current).to(
+                    self.model.prefix_gru.weight_ih_l0.dtype
+                )
+                _, gru_hidden = self.model.prefix_gru(new_embed, gru_hidden)
+        return {"token_ids": torch.cat(tokens, dim=1), "algorithm": "domino"}
+
+
 class MLAEagleConsumer:
     """Greedy recurrent MLA proposals with an owner-local materialized KV cache.
 

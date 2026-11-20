@@ -88,6 +88,12 @@ class AutoDraftModelConfig:
     def from_dict(cls, config: dict):
         config = dict(config)
 
+        nested = config.get("dflash_config")
+        if isinstance(nested, dict) and nested.get("projector_type") == "domino":
+            from aspec.models.draft.domino import normalize_official_domino_config
+
+            config = normalize_official_domino_config(config)
+
         if "tie_word_embeddings" in config and config.get("architectures") != ["MedusaDraftModel"]:
             logger.info("Set draft model tie_word_embeddings to False")
             config["tie_word_embeddings"] = False
