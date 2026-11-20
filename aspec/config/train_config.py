@@ -247,6 +247,12 @@ class TrainingConfig:
     domino_lambda_base_decay_ratio: Optional[float] = None
     # Report backbone-only per-position held-out metrics alongside corrected.
     domino_eval_backbone: bool = False
+    # JetSpec distills the frozen Target distribution with T^2 * KL(p || q).
+    # Full-vocabulary KL intermediates are processed in bounded token chunks.
+    jetspec_distillation_temperature: float = 1.0
+    jetspec_kl_chunk_rows: int = 256
+    # Main JetSpec results use uniform per-position weights (gamma = 0).
+    jetspec_loss_decay_gamma: float = 0.0
     # Pack multiple complete documents into one fixed row. The controller owns
     # grouping; the trainer preserves document boundaries for attention/RoPE.
     dflash_packing: bool = False

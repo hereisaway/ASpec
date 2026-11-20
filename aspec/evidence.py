@@ -1055,9 +1055,24 @@ class RunEvidenceRecorder:
             attention_policy_observed = bool(consumers) and all(
                 attention_observed(item) for item in consumers
             )
-            if (
+            attention_decision = next(
                 (
-                    planned_attention_backend in {"fa4", "cudnn_flex_attention"}
+                    item
+                    for item in self._plan.capabilities
+                    if item.name == "draft_attention_execution"
+                ),
+                None,
+            )
+            attention_planned = (
+                attention_decision is not None
+                and attention_decision.effective_state != "omitted"
+            )
+            if (
+                attention_planned
+                and (
+                    planned_attention_backend in {
+                        "fa4", "cudnn_flex_attention", "flex_attention",
+                    }
                     or selected_policy_requested
                 )
                 and attention_policy_observed

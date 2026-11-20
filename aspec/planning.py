@@ -452,6 +452,71 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
         if not isinstance(_select(config, "training.domino_eval_backbone", False), bool):
             raise PlanCompileError("domino_eval_backbone must be boolean")
 
+    if family == "jetspec":
+        from aspec.models.draft.jetspec import JetSpecConfig
+
+        try:
+            raw = JetSpecConfig.from_dict(raw).to_dict()
+        except (ValueError, TypeError) as exc:
+            raise PlanCompileError(str(exc)) from exc
+        if raw["block_size"] != _select(config, "training.dflash_block_size"):
+            raise PlanCompileError(
+                "JetSpec block_size must match training.dflash_block_size"
+            )
+        if raw.get("cudnn_gqa_mode", "auto") != "auto":
+            raise PlanCompileError(
+                "JetSpec requires cudnn_gqa_mode=auto; the FlexAttention mask "
+                "controls causal block visibility"
+            )
+        backend = _select(config, "training.attention_backend")
+        if backend != "flex_attention":
+            raise PlanCompileError(
+                "JetSpec requires training.attention_backend=flex_attention; "
+                "that is the masked block-attention path the CUDA dispatcher uses"
+            )
+        if _select(config, "training.draft_context_parallel_size", 1) != 1:
+            raise PlanCompileError("JetSpec currently supports draft_context_parallel_size=1")
+        if _select(config, "training.dflash_packing", False):
+            raise PlanCompileError(
+                "JetSpec does not support sequence packing; set "
+                "training.dflash_packing=false"
+            )
+        if _select(config, "training.compile_model", False):
+            raise PlanCompileError("JetSpec whole-model compile has not been enabled")
+        if _select(config, "training.dflash_loss_objective") != "decay":
+            raise PlanCompileError("JetSpec supports the decay loss objective only")
+        if (_select(config, "training.dflash_ce_loss_alpha") != 0.0
+                or _select(config, "training.dflash_l1_loss_alpha") != 0.0):
+            raise PlanCompileError(
+                "JetSpec replaces the CE/L1 mix; set dflash_ce_loss_alpha=0.0 "
+                "and dflash_l1_loss_alpha=0.0"
+            )
+        temperature = _select(config, "training.jetspec_distillation_temperature", 1.0)
+        min_temperature = 1e-6
+        max_temperature = math.sqrt(3.4028234663852886e38)
+        if (isinstance(temperature, bool)
+                or not isinstance(temperature, (int, float))
+                or not math.isfinite(temperature)
+                or not min_temperature <= temperature <= max_temperature):
+            raise PlanCompileError(
+                "jetspec_distillation_temperature must be finite and in "
+                f"[{min_temperature:g}, {max_temperature:g}]"
+            )
+        chunk_rows = _select(config, "training.jetspec_kl_chunk_rows", 256)
+        if (isinstance(chunk_rows, bool) or not isinstance(chunk_rows, int)
+                or chunk_rows < 1):
+            raise PlanCompileError("jetspec_kl_chunk_rows must be a positive integer")
+        gamma = _select(config, "training.jetspec_loss_decay_gamma", 0.0)
+        if (isinstance(gamma, bool) or not isinstance(gamma, (int, float))
+                or not math.isfinite(gamma) or gamma < 0):
+            raise PlanCompileError(
+                "jetspec_loss_decay_gamma must be a finite non-negative number"
+            )
+        if not _select(config, "inference.store_last_hidden_states", False):
+            raise PlanCompileError(
+                "JetSpec forward KL requires inference.store_last_hidden_states=true"
+            )
+
     target_layer_ids = raw.get("target_layer_ids")
     if not isinstance(target_layer_ids, list) or not target_layer_ids:
         raise PlanCompileError(
@@ -1480,6 +1545,25 @@ def _workload(
                 "gru_hidden_dim": draft["domino_gru_hidden_dim"],
             },
         }
+    elif family == "jetspec":
+        objective = {
+            "family": "jetspec",
+            "loss": "temperature_scaled_forward_kl",
+            "block_size": _select(config, "training.dflash_block_size"),
+            "num_anchors": _select(config, "training.dflash_num_anchors"),
+            "num_target_layers": _select(config, "training.dflash_num_target_layers"),
+            "loss_objective": _select(config, "training.dflash_loss_objective"),
+            "loss_decay_gamma": _select(config, "training.jetspec_loss_decay_gamma", 0.0),
+            "ce_loss_alpha": 0.0,
+            "l1_loss_alpha": 0.0,
+            "distillation_temperature": _select(
+                config, "training.jetspec_distillation_temperature", 1.0
+            ),
+            "kl_chunk_rows": _select(config, "training.jetspec_kl_chunk_rows", 256),
+            "prediction_start": 1,
+            "teacher_feature": "last_hidden_states",
+            "frozen_parts": ["target_lm_head"],
+        }
     elif family == "dspark":
         objective = {
             "family": family,
@@ -1530,7 +1614,7 @@ def _workload(
         objective["frozen_parts"] = (["draft_body", "embedding", "lm_head"]
                                      if draft["eagle4"]["stage"] == "candidate_head" else
                                      ["embedding", "candidate_head"] + (["lm_head"] if _select(config, "model.freeze_lm_head", False) else []))
-    if family in {"dspark", "dflash", "dflash2", "domino"}:
+    if family in {"dspark", "dflash", "dflash2", "domino", "jetspec"}:
         objective["anchor_sampling_scope"] = anchor_scope
     if draft.get("mtp_conditioning"):
         from aspec.config.mtp_conditioning import mtp_conditioning_semantics
@@ -2127,7 +2211,7 @@ def compile_execution_plan(
         or draft["attention"]["csa"] is not None
         or draft["attention"]["qsa"] is not None
         or draft["attention"].get("dsa") is not None
-        or draft["family"] == "domino"
+        or draft["family"] in {"domino", "jetspec"}
     )
     direct_target_output = bool(
         _select(config, "inference.target_prefill_memory_optimized", False)

@@ -193,6 +193,10 @@ def _serving_config(raw_config: dict) -> dict:
         native["architectures"] = ["Qwen3_5ForCausalLMMTP"]
         native["mtp_num_hidden_layers"] = 1
         return native
+    if raw_config.get("architectures") == ["JetSpecDraftModel"]:
+        raise NotImplementedError(
+            "JetSpec requires --format aspec; SGLang 0.5.21 has no JetSpec serving loader"
+        )
     attention = resolve_draft_attention(raw_config)
     if attention["csa"] is not None:
         raise NotImplementedError(
