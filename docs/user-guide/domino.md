@@ -86,11 +86,12 @@ aspec export --input-dir outputs/domino-qwen3-8b/checkpoints/iter_0000009 \
   --output-dir outputs/domino-qwen3-8b-asset --format aspec
 ```
 
-Domino deliberately rejects the SGLang artifact format: the validated SGLang 0.5.21
-loader has no matching correction-head path, so a silent DFlash-style export would
-drop `prefix_gru`/`embed_proj`. The native manifest records the Domino algorithm,
-trained `block_size`, label layout, Target feature layers and the full training
-objective. `aspec.draft_artifact.load_native_draft` validates the checksums and
+Domino currently exports native-only. ASpec has not validated its SGLang export:
+upstream SGLang 0.5.21 does load `prefix_gru`/`embed_proj` and has an end-to-end
+test for the published checkpoint, but a silent DFlash-style export could still
+drop or mis-bind the correction head. The native manifest records the Domino
+algorithm, trained `block_size`, label layout, Target feature layers and the full
+training objective. `aspec.draft_artifact.load_native_draft` validates the checksums and
 semantics, then loads every tensor strictly. A real 8-step checkpoint has been
 roundtripped through this path (63 tensors, exact values and dtypes).
 

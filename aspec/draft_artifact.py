@@ -181,9 +181,8 @@ class BlockDraftConsumer:
         if saved is not None and saved != block_size:
             raise ValueError("Proposal block size disagrees with the trained asset")
         self.block_size = block_size
-        backend = "fa4" if next(draft_model.parameters()).device.type == "cuda" else "sdpa"
         self.backbone = DFlashModel(draft_model, block_size=block_size, num_anchors=1,
-                                   attention_backend=backend)
+                                   attention_backend="fa4")
         # Explicit inference component: keep the actual stage and selection, but
         # never project teacher distributions or compute training-only indexer KL.
         from aspec.models.draft.csa import CSALayer, CSALightningIndexer
@@ -277,6 +276,9 @@ class DominoConsumer:
         backend = "fa4" if next(draft_model.parameters()).device.type == "cuda" else "sdpa"
         self.backbone = DFlashModel(draft_model, block_size=block_size, num_anchors=1,
                                    attention_backend=backend)
+        # Match Domino training on CPU: hide context rows at/after the anchor and
+        # other blocks with the same dense block mask instead of plain SDPA.
+        self.backbone._materialize_cpu_block_mask = True
 
     @torch.no_grad()
     def propose(self, input_ids, target_features, *, lm_head_weight):

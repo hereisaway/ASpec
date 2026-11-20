@@ -184,8 +184,9 @@ def _serving_config(raw_config: dict) -> dict:
         raise NotImplementedError("MTP-conditioned Drafts require native --format aspec export")
     if raw_config.get("architectures") == ["DominoDraftModel"]:
         raise NotImplementedError(
-            "Domino requires native --format aspec export; official SGLang has no "
-            "matching correction-head loader"
+            "Domino SGLang export is not validated in ASpec yet; use --format aspec. "
+            "Upstream SGLang 0.5.21 includes a Domino loader and an end-to-end test, "
+            "but ASpec has not validated its exported artifact against it"
         )
 
     if raw_config.get("architectures") == ["MedusaDraftModel"]:

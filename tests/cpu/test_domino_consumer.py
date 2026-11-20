@@ -3,6 +3,7 @@
 
 """Domino native proposal mirrors the published sequential correction rollout."""
 
+import pytest
 import torch
 
 from aspec.draft_artifact import DominoConsumer
@@ -112,3 +113,19 @@ def test_domino_consumer_rejects_other_block_algorithms():
         assert "Domino" in str(exc)
     else:
         raise AssertionError("DominoConsumer accepted a non-Domino asset")
+
+
+@pytest.mark.parametrize("shift_label,prefix_len", [(True, 1), (False, 0)])
+def test_anchor_target_feature_is_hidden_from_the_block(shift_label, prefix_len):
+    model, ids, features, head = _setup(shift_label=shift_label, prefix_len=prefix_len)
+    consumer = DominoConsumer(model, block_size=model.config.block_size)
+    baseline = _block_hidden(consumer, ids, features)
+
+    changed = features.clone()
+    changed[:, -1, :] += 10.0
+    after = _block_hidden(consumer, ids, changed)
+    torch.testing.assert_close(after, baseline, atol=0, rtol=0)
+
+    baseline_tokens = consumer.propose(ids, features, lm_head_weight=head)["token_ids"]
+    changed_tokens = consumer.propose(ids, changed, lm_head_weight=head)["token_ids"]
+    torch.testing.assert_close(changed_tokens, baseline_tokens, atol=0, rtol=0)
