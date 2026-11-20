@@ -5,18 +5,18 @@ This implements [ASpec #38](https://github.com/inclusionAI/ASpec/issues/38) thro
 `aspec.models.domino.DominoModel`: a block-parallel DFlash backbone with a
 GRU-conditioned causal correction head. The ASpec training CLI now selects this
 algorithm through `aspec/config/domino_qwen3_8b_draft_config.json`. The
-[supplementary held-out example](../../configs/examples/domino_qwen3_8b_eval.yaml)
-and the [smoke workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) both run
-one Target GPU plus two Draft GPUs at 4K (three GPUs total).
+[formal recipe](../../configs/recipes/domino_qwen3_8b.yaml) and the
+[smoke workflow](../../configs/examples/domino_qwen3_8b_4k_tcp.yaml) both run one
+Target GPU plus two Draft GPUs at 4K (three GPUs total).
 
 ## Training selection
 
 - Draft config: `aspec/config/domino_qwen3_8b_draft_config.json` (Qwen3-8B,
   `block_size=16`, `shift_label=true`, `pure_draft_prefix_len=1`).
-- Held-out example: `configs/examples/domino_qwen3_8b_eval.yaml` (FlexAttention,
-  CP1, non-packing, REPLICATE, Store/TCP transport, held-out eval and the linear
-  `lambda_base` curriculum). Catalog promotion waits for native export/strict
-  reload validation; `domino_qwen3_8b_4k_tcp.yaml` remains a shorter smoke test.
+- Formal recipe: `configs/recipes/domino_qwen3_8b.yaml` (FlexAttention, CP1,
+  non-packing, REPLICATE, Store/TCP transport, held-out eval and the linear
+  `lambda_base` curriculum). It is catalogued as `domino`; its export boundary is
+  native-only. `domino_qwen3_8b_4k_tcp.yaml` remains a shorter smoke test.
 - `training.domino_lambda_base` is the constant fallback. Set both
   `training.domino_lambda_base_start` and `training.domino_lambda_base_decay_ratio`
   to apply the reference linear schedule. Exact recovery records the constant,
@@ -42,7 +42,7 @@ CUDA_VISIBLE_DEVICES=0 aspec target \
 ```
 
 For held-out data and the curriculum, set `ASPEC_TRAIN_DATA` and `ASPEC_EVAL_DATA`
-and use `configs/examples/domino_qwen3_8b_eval.yaml`. Compile the smoke example,
+and use `configs/recipes/domino_qwen3_8b.yaml`. Compile the smoke example,
 then train with two Draft GPUs (GPUs 1 and 2):
 
 ```bash
@@ -77,13 +77,69 @@ decoding-acceptance evidence. A GPU run with one Target plus two Draft GPUs has 
 reported for training and exact resume; it does not establish model quality. Supply
 licensed data, a full learning-rate horizon and the recipe for a real run.
 
+## Export and strict reload
+
+Export a trained checkpoint with the native ASpec artifact format:
+
+```bash
+aspec export --input-dir outputs/domino-qwen3-8b/checkpoints/iter_0000009 \
+  --output-dir outputs/domino-qwen3-8b-asset --format aspec
+```
+
+Domino deliberately rejects the SGLang artifact format: the validated SGLang 0.5.21
+loader has no matching correction-head path, so a silent DFlash-style export would
+drop `prefix_gru`/`embed_proj`. The native manifest records the Domino algorithm,
+trained `block_size`, label layout, Target feature layers and the full training
+objective. `aspec.draft_artifact.load_native_draft` validates the checksums and
+semantics, then loads every tensor strictly. A real 8-step checkpoint has been
+roundtripped through this path (63 tensors, exact values and dtypes).
+
+### Official checkpoint mapping
+
+The published `Huang2020/Qwen3-8B-Domino-b16` checkpoint uses
+`architectures=["DFlashDraftModel"]`, `model_type="qwen3"`, and nests the Domino
+fields under `dflash_config`. In that layout `num_target_layers` is the Target
+decoder depth (36), not ASpec's feature count (5). Convert the config once before
+training:
+
+```python
+import json
+from aspec.models.draft import AutoDraftModelConfig
+
+raw = json.load(open("Qwen3-8B-Domino-b16/config.json"))
+json.dump(AutoDraftModelConfig.from_dict(raw).to_dict(), open("aspec_domino.json", "w"))
+```
+
+`AutoDraftModelConfig.from_dict` detects `dflash_config.projector_type="domino"`
+and produces the flat `DominoDraftModel`/`model_type="domino"` config. The published
+weight names already match ASpec's export names (`fc`, `hidden_norm`, `norm`,
+`layers.*`, `prefix_gru.*`, `embed_proj.*`); `load_initial_draft_weights` maps them
+back and borrows the missing `embed_tokens.weight` from the Target. Verified against
+the published config and all 62 tensor names/shapes.
+
+### Native proposal component
+
+`aspec.draft_artifact.DominoConsumer` loads a native Domino asset and rolls out one
+block: the DFlash backbone stays block-parallel, the pure prefix keeps backbone
+logits, and the suffix is generated sequentially with `prefix_gru` + `embed_proj`
+using already generated tokens. It mirrors the reference `spec_generate` indexing for
+both `shift_label=true` and `shift_label=false`. The manifest advertises this
+entrypoint; verification and acceptance remain caller-owned.
+
 ## Validation status
 
 Plan compilation, registration, trainer construction, checkpoint topology and the
 CPU numerical contracts are covered by `tests/cpu`. A GPU run with one Target and two
 Draft GPUs verified 8-step training and step-4 exact resume: losses, model tensors,
 optimizer state and RNG state matched the uninterrupted run. The public CI lane is
-CPU-only; no throughput, quality or decoding-acceptance claim is made here.
+CPU-only; no throughput or convergence claim is made here.
+
+A bounded comparison against SpecForge at its Domino merge commit used the same
+published Qwen3-8B Domino checkpoint, 16 train / 16 held-out rows, 8 steps, block 16,
+128 anchors, FlexAttention and the same linear `lambda_base` schedule. Both trainers
+kept corrected acceptance above the backbone-only branch. Anchor sampling, batch
+aggregation and acceptance naming differ (SpecForge reports accepted tokens including
+the root), so the comparison is directional rather than a strict parity test.
 
 ## Reference and selected scope
 
@@ -212,8 +268,9 @@ handling, empty supervision, and frozen Target/embedding behavior.
 
 ## Remaining work
 
-Native export with strict reloading, Target bindings, proposal consumers and
-acceptance observations remain pending. Recipe catalog promotion also waits for the
-native export/strict reload check. The next planned increment is the aligned
-SpecForge-vs-ASpec comparison. CPU numerical and Plan checks do not establish
+Native export with strict reloading works for ASpec FSDP checkpoints, the official
+Qwen3-8B Domino config/weight layout maps into ASpec, and the native
+`DominoConsumer` produces proposal tokens for both label layouts. Remaining work is
+longer convergence/quality evidence and a real decoding-serving acceptance run;
+the recipe is catalogued because the native export/strict reload check passes. CPU numerical and Plan checks do not establish
 Qwen3-8B training quality, GPU throughput or decoding acceptance.

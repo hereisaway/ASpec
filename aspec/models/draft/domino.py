@@ -177,3 +177,75 @@ class DominoDraftModel(DFlashDraftModel):
             dim=2,
         )
         return corrected.reshape(batch, draft_len, logits.size(-1))
+
+
+def normalize_official_domino_config(raw: dict) -> dict:
+    """Translate the published Domino config layout into ASpec's flat layout.
+
+    The reference checkpoint publishes ``architectures=["DFlashDraftModel"]``,
+    ``model_type="qwen3"`` and nests the Domino fields under ``dflash_config``.
+    In that layout ``num_target_layers`` is the Target decoder depth, while
+    ASpec's flat config uses it as the number of captured feature layers.
+    """
+    raw = dict(raw)
+    nested = raw.pop("dflash_config", None)
+    if not isinstance(nested, dict) or nested.get("projector_type") != "domino":
+        raise ValueError("Not an official Domino draft config")
+    layer_ids = nested.get("target_layer_ids")
+    if not isinstance(layer_ids, list) or not layer_ids:
+        raise ValueError("Official Domino config requires target_layer_ids")
+    target_depth = raw.get("num_target_layers")
+    if isinstance(target_depth, bool) or not isinstance(target_depth, int) or target_depth < 1:
+        raise ValueError("Official Domino config requires the Target decoder depth")
+    raw["architectures"] = ["DominoDraftModel"]
+    raw["model_type"] = "domino"
+    raw["projector_type"] = "domino"
+    for key in (
+        "mask_token_id",
+        "shift_label",
+        "target_layer_ids",
+        "pure_draft_prefix_len",
+        "gru_hidden_dim",
+        "emb_dim",
+    ):
+        if key in nested:
+            raw[key] = nested[key]
+    raw["num_target_layers"] = len(layer_ids)
+    raw["target_num_hidden_layers"] = target_depth
+    raw.pop("auto_map", None)
+    raw.pop("max_window_layers", None)
+    return raw
+
+
+def official_domino_config(raw: dict) -> dict:
+    """Translate ASpec's flat Domino config into the published HF layout."""
+    from aspec.config.draft_algorithm import resolve_draft_algorithm
+
+    raw = dict(raw)
+    if resolve_draft_algorithm(raw) != "domino":
+        raise ValueError("Not an ASpec Domino draft config")
+    target_depth = raw.get("target_num_hidden_layers")
+    layer_ids = raw.get("target_layer_ids")
+    if isinstance(target_depth, bool) or not isinstance(target_depth, int) or target_depth < 1:
+        raise ValueError("Domino export requires the Target decoder depth")
+    if not isinstance(layer_ids, list) or not layer_ids:
+        raise ValueError("Domino export requires target_layer_ids")
+    nested = {
+        key: raw[key]
+        for key in (
+            "projector_type",
+            "mask_token_id",
+            "shift_label",
+            "target_layer_ids",
+            "pure_draft_prefix_len",
+            "gru_hidden_dim",
+            "emb_dim",
+        )
+        if key in raw
+    }
+    raw["architectures"] = ["DFlashDraftModel"]
+    raw["model_type"] = "qwen3"
+    raw["num_target_layers"] = target_depth
+    raw["dflash_config"] = nested
+    raw.pop("auto_map", None)
+    return raw
