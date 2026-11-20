@@ -139,6 +139,23 @@ def test_plan_compiles_with_jetspec_objective(tmp_path):
     assert runtime["jetspec_loss_decay_gamma"] == 0.0
 
 
+@pytest.mark.parametrize("temperature, accepted", [(1.0, True), (1.8446744e19, False)])
+def test_plan_matches_trainer_temperature_limit(tmp_path, temperature, accepted):
+    override = f"training.jetspec_distillation_temperature={temperature}"
+    if accepted:
+        config, args = _config(tmp_path, override)
+        plan = compile_execution_plan(
+            config, config_path=str(_EXAMPLE), cli_args=args
+        ).to_dict()
+        assert plan["workload"]["objective"]["distillation_temperature"] == temperature
+    else:
+        with pytest.raises(PlanCompileError, match="jetspec_distillation_temperature"):
+            config, args = _config(tmp_path, override)
+            compile_execution_plan(
+                config, config_path=str(_EXAMPLE), cli_args=args
+            )
+
+
 @pytest.mark.parametrize("override, error", _ILLEGAL_OVERRIDES)
 def test_plan_rejects_unsupported_jetspec_combinations(tmp_path, override, error):
     target = f"model.target_model_path={_fake_qwen_target(tmp_path)}"

@@ -492,14 +492,15 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
                 "and dflash_l1_loss_alpha=0.0"
             )
         temperature = _select(config, "training.jetspec_distillation_temperature", 1.0)
-        max_temperature = 1.8446744073709552e19
+        min_temperature = 1e-6
+        max_temperature = math.sqrt(3.4028234663852886e38)
         if (isinstance(temperature, bool)
                 or not isinstance(temperature, (int, float))
                 or not math.isfinite(temperature)
-                or not 1e-6 <= temperature <= max_temperature):
+                or not min_temperature <= temperature <= max_temperature):
             raise PlanCompileError(
                 "jetspec_distillation_temperature must be finite and in "
-                "[1e-06, 1.8446744073709552e+19]"
+                f"[{min_temperature:g}, {max_temperature:g}]"
             )
         chunk_rows = _select(config, "training.jetspec_kl_chunk_rows", 256)
         if (isinstance(chunk_rows, bool) or not isinstance(chunk_rows, int)
