@@ -3,6 +3,9 @@
 
 """Heads-only Medusa uses the existing optimizer/checkpoint/ownership training path."""
 
+import copy
+import json
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 from aspec.models.medusa import MedusaModel
@@ -16,6 +19,42 @@ class MedusaTrainer(Eagle3Trainer):
             draft_model,
             gradient_checkpointing=getattr(self.args, "gradient_checkpointing", False),
         )
+
+    def _load_algorithm_weights(self, draft_model, target_model_path):
+        # Plan can only bind the vocabulary when the Target config is local.
+        # Resolve the effective config here as well so a Hub ID cannot skip it.
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(
+            target_model_path,
+            trust_remote_code=getattr(self.args, "trust_remote_code", False),
+        ).to_dict()
+        extra_args = getattr(self.args, "sglang_extra_args", None) or {}
+        overrides = extra_args.get("json_model_override_args")
+        if overrides is not None:
+            if isinstance(overrides, str):
+                try:
+                    overrides = json.loads(overrides)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "inference.sglang.extra_args.json_model_override_args must be "
+                        f"valid JSON: {exc}") from exc
+            if not isinstance(overrides, Mapping):
+                raise ValueError(
+                    "inference.sglang.extra_args.json_model_override_args must contain "
+                    "a JSON object")
+            config.update(copy.deepcopy(dict(overrides)))
+        target_vocab_size = config.get("vocab_size")
+        text_config = config.get("text_config")
+        if target_vocab_size is None and isinstance(text_config, Mapping):
+            target_vocab_size = text_config.get("vocab_size")
+        if not isinstance(target_vocab_size, int) or isinstance(target_vocab_size, bool):
+            raise ValueError("Medusa requires the Target config to declare vocab_size")
+        if draft_model.vocab_size != target_vocab_size:
+            raise ValueError(
+                "Medusa heads project the full Target vocabulary: "
+                f"draft vocab_size {draft_model.vocab_size} != "
+                f"Target vocab_size {target_vocab_size}")
 
     def _prepare_algorithm_training(self, draft_model):
         if getattr(self.args, "freeze_lm_head", False):

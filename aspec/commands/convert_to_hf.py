@@ -105,6 +105,23 @@ def _aspec_version() -> str:
         return "unknown"
 
 
+def _export_tensors(serving_state):
+    """Detach state tensors, cloning repeated storage so safetensors accepts it."""
+    tensors = {}
+    seen_storage = set()
+    for key, value in serving_state.items():
+        tensor = value.detach().cpu().contiguous()
+        storage = tensor.untyped_storage().data_ptr()
+        if storage in seen_storage:
+            # Shared residual-block depths repeat one module, so several state
+            # keys alias one storage. Keep every key but give the file real copies.
+            tensor = tensor.clone()
+        else:
+            seen_storage.add(storage)
+        tensors[key] = tensor
+    return tensors
+
+
 def _detect_model_dir(input_dir: Path) -> Path:
     model_dir = input_dir / "model"
     return model_dir if model_dir.is_dir() else input_dir
@@ -165,6 +182,11 @@ def _serving_config(raw_config: dict) -> dict:
 
     if raw_config.get("mtp_conditioning"):
         raise NotImplementedError("MTP-conditioned Drafts require native --format aspec export")
+
+    if raw_config.get("architectures") == ["MedusaDraftModel"]:
+        raise NotImplementedError(
+            "Medusa heads require native --format aspec export; "
+            "SGLang has no verified candidate-tree Medusa loader")
 
     if raw_config.get("architectures") == ["NativeMTPDraftModel"]:
         native = json.loads(json.dumps(raw_config["native_config"]))
@@ -343,6 +365,7 @@ def convert_checkpoint(
     output_dtype: torch.dtype | None = None,
     force: bool = False,
     artifact_format: str = "sglang",
+    verify: bool = False,
 ) -> dict:
     input_dir = input_dir.expanduser().resolve()
     model_dir = _detect_model_dir(input_dir)
@@ -358,7 +381,9 @@ def convert_checkpoint(
     raw_config = json.loads(config_path.read_text(encoding="utf-8"))
     if artifact_format not in {"sglang", "aspec"}:
         raise ValueError("artifact_format must be sglang or aspec")
-    if resolve_draft_algorithm(raw_config) == "mtp":
+    if verify and artifact_format != "aspec":
+        raise ValueError("--verify requires --format aspec")
+    if resolve_draft_algorithm(raw_config) in {"mtp", "medusa"}:
         raw_config = AutoDraftModelConfig.from_dict(raw_config).to_dict()
     training_contract = _checkpoint_training_contract(model_dir, raw_config)
     export_config = (_serving_config(raw_config) if artifact_format == "sglang"
@@ -418,10 +443,7 @@ def convert_checkpoint(
         model.state_dict_for_serving() if hasattr(model, "state_dict_for_serving")
         else to_export_keys(model.state_dict())
     )
-    tensors = {
-        key: value.detach().cpu().contiguous()
-        for key, value in serving_state.items()
-    }
+    tensors = _export_tensors(serving_state)
 
     eagle4_asset = None
     if resolve_draft_algorithm(raw_config) == "eagle4":
@@ -469,7 +491,9 @@ def convert_checkpoint(
 
         manifest["mtp_conditioning"] = mtp_conditioning_semantics(raw_config)
     if artifact_format == "aspec":
-        manifest["compute_dtype"] = str(model.embed_tokens.weight.dtype)
+        embedding = getattr(model, "embed_tokens", None)
+        compute = embedding.weight if embedding is not None else next(iter(tensors.values()))
+        manifest["compute_dtype"] = str(compute.dtype)
         manifest["tensor_dtypes"] = dict(Counter(str(t.dtype) for t in tensors.values()))
         if len(manifest["tensor_dtypes"]) > 1:
             manifest["dtype"] = "mixed"
@@ -488,14 +512,26 @@ def convert_checkpoint(
             "runtime": "aspec", "entrypoint": "aspec.draft_artifact.load_native_draft",
             "proposal_entrypoint": proposal,
             "validation": "required_per_artifact",
-            "scope": ("asset and proposal; caller owns verifier features/cache/verification"
-                      if proposal else "asset loading and weights-only warmstart; no native proposal component"),
+            "scope": (
+                "asset and proposal; caller owns verifier features/cache/verification"
+                if proposal else
+                "heads-only asset; strict reload and per-head held-out metrics; "
+                "no candidate-tree acceptance" if algorithm == "medusa" else
+                "asset loading and weights-only warmstart; no native proposal component"),
             "borrowed_tensors": ["Target output head"] if algorithm in {"dspark", "dflash"} else [],
         }
     (output_dir / "export_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    if verify:
+        from aspec.draft_artifact import verify_native_export
+
+        manifest["verified"] = verify_native_export(output_dir, expected=tensors)
+        (output_dir / "export_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     return manifest
 
 
@@ -511,6 +547,10 @@ def _parse_args() -> argparse.Namespace:
         "--dtype", choices=("float16", "bfloat16", "float32"), default=None
     )
     parser.add_argument("-f", "--force", action="store_true")
+    parser.add_argument(
+        "--verify", action="store_true",
+        help="Strictly reload the native artifact and compare every tensor",
+    )
     return parser.parse_args()
 
 
@@ -527,6 +567,7 @@ def main() -> None:
         output_dtype=dtype,
         force=args.force,
         artifact_format=args.artifact_format,
+        verify=args.verify,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
 
