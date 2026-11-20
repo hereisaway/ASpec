@@ -12,7 +12,7 @@ from tools.validation import domino_acceptance_ablation as ablation
 
 
 def _write_asset(root, *, algorithm="domino", storage_format="sglang"):
-    root.mkdir()
+    root.mkdir(parents=True)
     tensors = {
         "fc.weight": torch.ones(4, 4),
         "embed_proj.0.weight": torch.ones(4, 4),
@@ -59,7 +59,15 @@ def test_backbone_ablation_requires_a_sglang_domino_asset(tmp_path, algorithm, s
         ablation.build_backbone_only(corrected, tmp_path / "backbone")
 
 
-def _record(length, *, data="d", prompt="p", verify=10):
+def test_backbone_ablation_rejects_overlapping_output(tmp_path):
+    corrected = tmp_path / "assets" / "corrected"
+    _write_asset(corrected)
+    for output in (corrected.parent, corrected / "backbone"):
+        with pytest.raises(ValueError, match="must not overlap"):
+            ablation.build_backbone_only(corrected, output, force=True)
+
+
+def _record(length, *, data="d", prompt="p", verify=10, target="Qwen3-8B", settings=None):
     summary = {
         "acceptance_length": length,
         "verify_count": verify,
@@ -70,6 +78,12 @@ def _record(length, *, data="d", prompt="p", verify=10):
         "algorithm": "DFLASH",
         "data_sha256": data,
         "prompt_tokens_sha256": prompt,
+        "target": target,
+        "settings": settings or {
+            "samples": 16, "max_new_tokens": 32, "repeats": 2, "tp": 1,
+            "domino_candidate_pool_size": 0, "disable_thinking": False,
+            "trust_remote_code": False, "deterministic_inference": False,
+        },
         "greedy_equal": True,
         "target_repeat_stable": True,
         "draft_repeat_stable": True,
@@ -84,3 +98,7 @@ def test_ablation_summary_requires_matching_prompts_and_reports_delta():
     assert result["corrected_minus_backbone"] == pytest.approx(0.8)
     with pytest.raises(ValueError, match="prompt_tokens_sha256"):
         ablation.summarize(_record(2.4), _record(1.6, prompt="other"))
+    with pytest.raises(ValueError, match="target differs"):
+        ablation.summarize(_record(2.4), _record(1.6, target="other"))
+    with pytest.raises(ValueError, match="decoding settings differ"):
+        ablation.summarize(_record(2.4), _record(1.6, settings={"samples": 8}))

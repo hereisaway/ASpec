@@ -48,8 +48,9 @@ def build_backbone_only(corrected: Path, output: Path, *, force: bool = False) -
         raise ValueError("requires a SGLang-format Domino export")
 
     output = Path(output).resolve()
-    if output == corrected:
-        raise ValueError("backbone output must differ from the corrected asset")
+    if (output == corrected or corrected.is_relative_to(output)
+            or output.is_relative_to(corrected)):
+        raise ValueError("backbone output must not overlap the corrected asset")
     if output.exists() and any(output.iterdir()):
         if not force:
             raise FileExistsError(f"output directory is not empty: {output}")
@@ -79,6 +80,17 @@ def build_backbone_only(corrected: Path, output: Path, *, force: bool = False) -
     return manifest
 
 
+_PAIRED_SETTINGS = (
+    "samples", "max_new_tokens", "repeats", "tp", "domino_candidate_pool_size",
+    "disable_thinking", "trust_remote_code", "deterministic_inference",
+)
+
+
+def _paired_settings(record: dict) -> dict:
+    settings = record.get("settings") or {}
+    return {key: settings.get(key) for key in _PAIRED_SETTINGS}
+
+
 def summarize(corrected: dict, backbone: dict) -> dict:
     """Combine two evaluate records after checking they describe the same prompts."""
     for name, record in (("corrected", corrected), ("backbone", backbone)):
@@ -89,6 +101,10 @@ def summarize(corrected: dict, backbone: dict) -> dict:
     for key in ("data_sha256", "prompt_tokens_sha256"):
         if corrected.get(key) != backbone.get(key):
             raise ValueError(f"{key} differs between corrected and backbone runs")
+    if corrected.get("target") != backbone.get("target"):
+        raise ValueError("target differs between corrected and backbone runs")
+    if _paired_settings(corrected) != _paired_settings(backbone):
+        raise ValueError("decoding settings differ between corrected and backbone runs")
     corrected_summary = corrected["runs"]["speculative"]["summary"]
     backbone_summary = backbone["runs"]["speculative"]["summary"]
     corrected_length = corrected_summary.get("acceptance_length")

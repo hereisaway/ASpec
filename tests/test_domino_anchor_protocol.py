@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import sys
 
 import pytest
 import torch
@@ -44,7 +45,7 @@ def test_anchor_protocol_rejects_noncanonical_schema():
         protocol.verify_anchors(record, samples)
 
 
-def test_anchor_cli_roundtrip_and_source_identity(tmp_path):
+def test_anchor_cli_roundtrip_and_source_identity(tmp_path, monkeypatch):
     source = tmp_path / "samples.jsonl"
     rows = [
         {"data_id": "a", "input_ids": list(range(40)), "loss_mask": [0] * 5 + [1] * 30 + [0] * 5},
@@ -52,13 +53,23 @@ def test_anchor_cli_roundtrip_and_source_identity(tmp_path):
     ]
     source.write_text("".join(json.dumps(row) + "\n" for row in rows))
     anchors = tmp_path / "anchors.json"
-    # Exercise the file-level identity check without spawning a subprocess.
-    samples = protocol._load_samples(source)
-    record = protocol.build_anchors(samples, num_anchors=4, block_size=5, seed=7)
-    record["source_sha256"] = protocol._sha256(source)
-    anchors.write_text(json.dumps(record))
-    loaded = json.loads(anchors.read_text())
-    assert loaded["source_sha256"] == protocol._sha256(source)
-    protocol.verify_anchors(loaded, samples)
+    common = ["--source", str(source), "--anchors", str(anchors),
+              "--num-anchors", "4", "--block-size", "5", "--seed", "7"]
+    monkeypatch.setattr(sys, "argv", ["domino_anchor_protocol", "build", *common])
+    protocol.main()
+    monkeypatch.setattr(sys, "argv", ["domino_anchor_protocol", "verify", *common])
+    protocol.main()
     source.write_text(source.read_text() + "\n")
-    assert json.loads(anchors.read_text())["source_sha256"] != protocol._sha256(source)
+    with pytest.raises(ValueError, match="source changed"):
+        protocol.main()
+
+
+def test_anchor_loader_accepts_jsonl_packed_loss_mask(tmp_path):
+    source = tmp_path / "samples.jsonl"
+    source.write_text(json.dumps({
+        "data_id": "a", "input_ids": [1, 2, 3, 4, 5], "packed_loss_mask": "2,3",
+    }) + "\n")
+    samples = protocol._load_samples(source)
+    assert samples[0]["loss_mask"].tolist() == [0, 0, 1, 1, 1]
+    record = protocol.build_anchors(samples, num_anchors=1, block_size=2, seed=1)
+    protocol.verify_anchors(record, samples)

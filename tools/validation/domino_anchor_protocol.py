@@ -51,8 +51,10 @@ def _load_samples(path: Path, limit: int | None = None) -> list[dict]:
         if input_ids is None:
             raise ValueError(f"sample {index} has no input_ids")
         input_ids = torch.as_tensor(input_ids).reshape(-1).long()
+        normalized = dict(row)
+        normalized["input_ids"] = input_ids
         if row.get("packed_loss_mask") is not None:
-            mask = resolve_loss_mask(dict(row))
+            mask = resolve_loss_mask(normalized)
         elif row.get("loss_mask") is not None:
             mask = torch.as_tensor(row["loss_mask"]).reshape(-1)
         else:
