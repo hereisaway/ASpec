@@ -136,3 +136,13 @@ def test_unknown_nested_projector_is_not_rewritten():
     config = AutoDraftModelConfig.from_dict(raw)
     assert config.architectures == ["DFlashDraftModel"]
     assert config.model_type == "qwen3"
+
+
+def test_published_layout_includes_default_projector():
+    flat = _raw()
+    flat.pop("projector_type")
+    published = official_domino_config(flat)
+    assert published["dflash_config"]["projector_type"] == "domino"
+    restored = normalize_official_domino_config(published)
+    assert restored["architectures"] == ["DominoDraftModel"]
+    assert restored["projector_type"] == "domino"

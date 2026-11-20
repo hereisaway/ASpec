@@ -233,7 +233,6 @@ def official_domino_config(raw: dict) -> dict:
     nested = {
         key: raw[key]
         for key in (
-            "projector_type",
             "mask_token_id",
             "shift_label",
             "target_layer_ids",
@@ -243,6 +242,9 @@ def official_domino_config(raw: dict) -> dict:
         )
         if key in raw
     }
+    # DominoConfig defaults the flat field; the published layout must carry the
+    # discriminator explicitly so the normalizer can recognize it.
+    nested["projector_type"] = "domino"
     raw["architectures"] = ["DFlashDraftModel"]
     raw["model_type"] = "qwen3"
     raw["num_target_layers"] = target_depth

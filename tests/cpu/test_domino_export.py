@@ -10,6 +10,7 @@ import torch
 
 from aspec.draft_artifact import load_native_draft
 from aspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
+from aspec.models.draft.domino import official_domino_config
 from aspec.training.checkpoint import load_initial_draft_weights
 from tools import convert_to_hf
 
@@ -162,3 +163,24 @@ def _write_config(tmp_path, raw):
     path = tmp_path / "changed_draft_config.json"
     path.write_text(json.dumps(raw))
     return path
+
+
+def test_native_export_accepts_the_published_domino_config(tmp_path, monkeypatch):
+    flat = _raw_config()
+    model = _model(flat)
+    _monkeypatch_checkpoint(monkeypatch, model)
+    published = official_domino_config(flat)
+    source = _prepare_source(tmp_path, published)
+    output = tmp_path / "asset"
+
+    manifest = convert_to_hf.convert_checkpoint(
+        input_dir=source, output_dir=output, artifact_format="aspec"
+    )
+
+    assert manifest["algorithm"] == "domino"
+    assert manifest["training_contract"]["block_size"] == flat["block_size"]
+    exported = json.loads((output / "config.json").read_text())
+    assert exported["architectures"] == ["DominoDraftModel"]
+    assert exported["model_type"] == "domino"
+    assert exported["num_target_layers"] == flat["num_target_layers"]
+    assert exported["target_num_hidden_layers"] == flat["target_num_hidden_layers"]

@@ -385,6 +385,11 @@ def convert_checkpoint(
         raise ValueError("Export output directory must not overlap the source checkpoint or config")
 
     raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    nested = raw_config.get("dflash_config")
+    if isinstance(nested, dict) and nested.get("projector_type") == "domino":
+        from aspec.models.draft.domino import normalize_official_domino_config
+
+        raw_config = normalize_official_domino_config(raw_config)
     if artifact_format not in {"sglang", "aspec"}:
         raise ValueError("artifact_format must be sglang or aspec")
     if verify and artifact_format != "aspec":
