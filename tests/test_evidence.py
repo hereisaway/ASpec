@@ -913,6 +913,41 @@ def test_flex_attention_execution_activates_required_jetspec_capability(tmp_path
     ]
 
 
+def test_omitted_plan_capability_is_not_activated_by_runtime_evidence(tmp_path):
+    overrides = [
+        "training.attention_backend=flex_attention",
+        "training.draft_context_parallel_size=1",
+    ]
+    config = load_config(config_path=str(_REFERENCE_CONFIG), cli_args=overrides)
+    plan = compile_execution_plan(
+        config, config_path=str(_REFERENCE_CONFIG), cli_args=overrides
+    )
+    planned = next(
+        item for item in plan.capabilities if item.name == "draft_attention_execution"
+    )
+    assert planned.effective_state == "omitted"
+    recorder = _recorder_for_plan(tmp_path, plan)
+
+    recorder.record_training(
+        {
+            "optimizer_steps_observed": 1,
+            "checkpoint": {"enabled": False, "exists": False},
+            "feature_contract": _feature_observation(plan),
+            "execution": {
+                "attention_backend": "flex_attention",
+                "context_parallel_size": 1,
+            },
+        }
+    )
+
+    capability = {
+        item["name"]: item for item in recorder.data["capabilities"]
+    }["draft_attention_execution"]
+    assert capability["effective_state"] == "omitted"
+    assert capability["effective"] is None
+    assert capability["evidence"] == []
+
+
 @pytest.mark.parametrize("observation", ["missing", "wrong_head_layout"])
 def test_full_attention_execution_requires_actual_head_layout(tmp_path, observation):
     overrides = ["training.attention_backend=cudnn_flex_attention"]

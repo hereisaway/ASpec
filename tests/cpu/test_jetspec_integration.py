@@ -27,6 +27,7 @@ from aspec.training.checkpoint import (
 from aspec.training.dflash_trainer import DFlashTrainer
 from aspec.training.jetspec_trainer import JetSpecTrainer
 from aspec.training.trainer_actor import _trainer_class_for_config
+from tools.convert_to_hf import _serving_config
 
 _REPO_ROOT = Path(__file__).parents[2]
 _EXAMPLE = _REPO_ROOT / "configs" / "examples" / "jetspec_qwen3_8b_4k_tcp.yaml"
@@ -99,6 +100,12 @@ def test_registration_resolves_jetspec():
     assert semantics["architectures"] == ["JetSpecDraftModel"]
     assert semantics["is_causal"] is True
     assert semantics["block_size"] == 5
+
+
+def test_sglang_serving_export_rejects_jetspec():
+    raw = json.loads(_DRAFT_JSON.read_text())
+    with pytest.raises(NotImplementedError, match="--format aspec"):
+        _serving_config(raw)
 
 
 def test_plan_compiles_with_jetspec_objective(tmp_path):

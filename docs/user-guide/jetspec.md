@@ -33,9 +33,8 @@ Prepare the Target in a separate environment and keep it running on GPU 0:
 
 ```bash
 aspec patch-sglang
-CUDA_VISIBLE_DEVICES=0 aspec target \
-  --config configs/examples/jetspec_qwen3_8b_4k_tcp.yaml \
-  model.target_model_path=/path/to/Qwen3-8B
+ASPEC_TARGET_MODEL=/path/to/Qwen3-8B CUDA_VISIBLE_DEVICES=0 \
+  aspec target --config configs/examples/jetspec_qwen3_8b_4k_tcp.yaml
 ```
 
 Compile the example, then train with two Draft GPUs (GPUs 1 and 2):
