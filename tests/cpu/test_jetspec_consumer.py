@@ -46,11 +46,9 @@ def _setup():
     return model, ids, features, head
 
 
-def _block_hidden(consumer, ids, features, *, override_last_block=None):
+def _block_hidden(consumer, ids, features):
     mask_token_id = consumer.config.mask_token_id
     padded = F.pad(ids, (0, consumer.block_size), value=mask_token_id)
-    if override_last_block is not None:
-        padded[:, ids.shape[1] - 1 + consumer.block_size - 1] = override_last_block
     padded_features = F.pad(features, (0, 0, 0, consumer.block_size))
     anchor = torch.tensor([[ids.shape[1] - 1]])
     return consumer.backbone._draft_backbone(
@@ -79,14 +77,25 @@ def test_jetspec_consumer_matches_direct_block_forward():
     torch.testing.assert_close(actual["token_ids"], expected, atol=0, rtol=0)
 
 
-def test_jetspec_consumer_ignores_later_block_positions():
+def test_jetspec_consumer_ignores_later_block_positions(monkeypatch):
     model, ids, features, head = _setup()
     consumer = JetSpecConsumer(model, block_size=model.config.block_size)
-
     baseline = _block_hidden(consumer, ids, features)
-    changed = _block_hidden(consumer, ids, features, override_last_block=17)
+
+    original = consumer.backbone._create_noise_embed
+
+    def perturb_last_draft_position(input_ids, anchor_positions, block_keep_mask):
+        embedding = original(input_ids, anchor_positions, block_keep_mask).clone()
+        embedding[:, -1, :] += 10.0
+        return embedding
+
+    monkeypatch.setattr(
+        consumer.backbone, "_create_noise_embed", perturb_last_draft_position
+    )
+    changed = _block_hidden(consumer, ids, features)
 
     torch.testing.assert_close(changed[:, :-1], baseline[:, :-1], atol=0, rtol=0)
+    assert not torch.equal(changed[:, -1], baseline[:, -1])
 
 
 def test_jetspec_anchor_target_feature_is_hidden_from_the_block():

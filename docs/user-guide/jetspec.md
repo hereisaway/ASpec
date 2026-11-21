@@ -79,7 +79,8 @@ and exact resume still need a hardware run before making quality claims.
 Export a trained checkpoint with the native ASpec artifact format:
 
 ```bash
-aspec export --input-dir outputs/jetspec-qwen3-8b/checkpoints/iter_0000009 \
+aspec export \
+  --input-dir outputs/jetspec_qwen3_8b_4k_tcp_resumed/checkpoints/iter_0000009 \
   --output-dir outputs/jetspec-qwen3-8b-asset --format aspec
 ```
 
