@@ -183,9 +183,15 @@ def _serving_config(raw_config: dict) -> dict:
     if raw_config.get("mtp_conditioning"):
         raise NotImplementedError("MTP-conditioned Drafts require native --format aspec export")
     if raw_config.get("architectures") == ["DominoDraftModel"]:
-        from aspec.models.draft.domino import official_domino_config
+        from aspec.models.draft.domino import DominoConfig, official_domino_config
 
-        config = official_domino_config(raw_config)
+        effective = DominoConfig.from_dict(raw_config).to_dict()
+        config = official_domino_config(effective)
+        if effective.get("fc_norm"):
+            raise NotImplementedError(
+                "SGLang Domino export cannot represent per-layer fc_norm; "
+                "use --format aspec"
+            )
         nested = config.get("dflash_config") or {}
         if nested.get("pure_draft_prefix_len") != 1:
             raise NotImplementedError(

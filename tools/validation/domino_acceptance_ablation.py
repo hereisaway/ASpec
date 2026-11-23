@@ -91,6 +91,13 @@ def _paired_settings(record: dict) -> dict:
     return {key: settings.get(key) for key in _PAIRED_SETTINGS}
 
 
+def _target_outputs(record: dict) -> list:
+    samples = ((record.get("runs") or {}).get("target_only") or {}).get("samples")
+    if not samples:
+        raise ValueError("both runs require target-only samples")
+    return [[row["output_ids"] for row in repeat] for repeat in samples]
+
+
 def summarize(corrected: dict, backbone: dict) -> dict:
     """Combine two evaluate records after checking they describe the same prompts."""
     for name, record in (("corrected", corrected), ("backbone", backbone)):
@@ -105,6 +112,8 @@ def summarize(corrected: dict, backbone: dict) -> dict:
         raise ValueError("target differs between corrected and backbone runs")
     if _paired_settings(corrected) != _paired_settings(backbone):
         raise ValueError("decoding settings differ between corrected and backbone runs")
+    if _target_outputs(corrected) != _target_outputs(backbone):
+        raise ValueError("target-only outputs differ between corrected and backbone runs")
     corrected_summary = corrected["runs"]["speculative"]["summary"]
     backbone_summary = backbone["runs"]["speculative"]["summary"]
     corrected_length = corrected_summary.get("acceptance_length")

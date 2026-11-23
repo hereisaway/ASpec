@@ -54,13 +54,44 @@ def test_anchor_cli_roundtrip_and_source_identity(tmp_path, monkeypatch):
     source.write_text("".join(json.dumps(row) + "\n" for row in rows))
     anchors = tmp_path / "anchors.json"
     common = ["--source", str(source), "--anchors", str(anchors),
-              "--num-anchors", "4", "--block-size", "5", "--seed", "7"]
-    monkeypatch.setattr(sys, "argv", ["domino_anchor_protocol", "build", *common])
+              "--num-anchors", "4", "--block-size", "5"]
+    monkeypatch.setattr(sys, "argv",
+                        ["domino_anchor_protocol", "build", *common, "--seed", "7"])
+    protocol.main()
+    monkeypatch.setattr(sys, "argv",
+                        ["domino_anchor_protocol", "verify", *common, "--seed", "7"])
     protocol.main()
     monkeypatch.setattr(sys, "argv", ["domino_anchor_protocol", "verify", *common])
     protocol.main()
+    monkeypatch.setattr(sys, "argv",
+                        ["domino_anchor_protocol", "verify", *common, "--seed", "42"])
+    with pytest.raises(ValueError, match="explicit seed=42"):
+        protocol.main()
     source.write_text(source.read_text() + "\n")
+    monkeypatch.setattr(sys, "argv", ["domino_anchor_protocol", "verify", *common])
     with pytest.raises(ValueError, match="source changed"):
+        protocol.main()
+
+
+@pytest.mark.parametrize("flags, name", [
+    (["--num-anchors", "3"], "num_anchors"),
+    (["--block-size", "6"], "block_size"),
+    (["--max-gap", "2"], "max_gap"),
+])
+def test_anchor_verify_rejects_explicit_parameter_mismatch(tmp_path, monkeypatch, flags, name):
+    source = tmp_path / "samples.jsonl"
+    source.write_text(json.dumps({
+        "data_id": "a", "input_ids": list(range(20)), "loss_mask": [0] + [1] * 19,
+    }) + "\n")
+    anchors = tmp_path / "anchors.json"
+    common = ["--source", str(source), "--anchors", str(anchors)]
+    monkeypatch.setattr(sys, "argv",
+                        ["domino_anchor_protocol", "build", *common, "--num-anchors", "4",
+                         "--block-size", "5", "--seed", "7"])
+    protocol.main()
+    monkeypatch.setattr(sys, "argv",
+                        ["domino_anchor_protocol", "verify", *common, *flags])
+    with pytest.raises(ValueError, match=f"explicit {name}"):
         protocol.main()
 
 

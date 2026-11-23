@@ -146,9 +146,9 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True,
                         help="tokenized .pt cache or JSONL with input_ids/loss_mask")
     parser.add_argument("--anchors", type=Path, required=True)
-    parser.add_argument("--num-anchors", type=int, default=128)
-    parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-anchors", type=int, default=None)
+    parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-gap", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
@@ -159,15 +159,26 @@ def main() -> None:
             raise FileExistsError(args.anchors)
         record = build_anchors(
             samples,
-            num_anchors=args.num_anchors,
-            block_size=args.block_size,
-            seed=args.seed,
+            num_anchors=128 if args.num_anchors is None else args.num_anchors,
+            block_size=16 if args.block_size is None else args.block_size,
+            seed=42 if args.seed is None else args.seed,
             max_gap=args.max_gap,
         )
         record["source_sha256"] = _sha256(args.source)
         args.anchors.write_text(json.dumps(record, sort_keys=True) + "\n")
     else:
         record = json.loads(args.anchors.read_text())
+        for name, value in (
+            ("num_anchors", args.num_anchors),
+            ("block_size", args.block_size),
+            ("seed", args.seed),
+            ("max_gap", args.max_gap),
+        ):
+            if value is not None and record.get(name) != value:
+                raise ValueError(
+                    f"explicit {name}={value} disagrees with anchor file "
+                    f"({record.get(name)})"
+                )
         if record.get("source_sha256") != _sha256(args.source):
             raise ValueError("anchor source changed; refusing to verify a different dataset")
         verify_anchors(record, samples)

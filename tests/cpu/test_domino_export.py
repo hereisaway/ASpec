@@ -154,6 +154,22 @@ def test_domino_native_export_rejects_block_size_that_disagrees_with_checkpoint(
         )
 
 
+def test_domino_serving_config_fills_domino_defaults():
+    raw = _raw_config()
+    for key in ("shift_label", "pure_draft_prefix_len", "emb_dim", "gru_hidden_dim"):
+        raw.pop(key)
+    exported = convert_to_hf._serving_config(raw)
+    assert exported["dflash_config"]["shift_label"] is True
+    assert exported["dflash_config"]["pure_draft_prefix_len"] == 1
+    assert exported["dflash_config"]["emb_dim"] == 256
+    assert exported["dflash_config"]["gru_hidden_dim"] == 1024
+
+
+def test_domino_serving_export_rejects_per_layer_fc_norm():
+    with pytest.raises(NotImplementedError, match="fc_norm"):
+        convert_to_hf._serving_config({**_raw_config(), "fc_norm": True})
+
+
 def test_domino_serving_config_uses_the_published_layout():
     raw = _raw_config()
     exported = convert_to_hf._serving_config(raw)
@@ -175,7 +191,7 @@ def test_domino_serving_config_uses_the_published_layout():
 
 @pytest.mark.parametrize("change, message", [
     ({"pure_draft_prefix_len": 0}, "pure_draft_prefix_len=1"),
-    ({"shift_label": 1}, "boolean shift_label"),
+    ({"shift_label": 1}, "shift_label.*boolean"),
 ])
 def test_domino_serving_export_rejects_unsupported_layout(change, message):
     with pytest.raises((NotImplementedError, ValueError), match=message):

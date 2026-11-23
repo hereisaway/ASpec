@@ -67,7 +67,8 @@ def test_backbone_ablation_rejects_overlapping_output(tmp_path):
             ablation.build_backbone_only(corrected, output, force=True)
 
 
-def _record(length, *, data="d", prompt="p", verify=10, target="Qwen3-8B", settings=None):
+def _record(length, *, data="d", prompt="p", verify=10, target="Qwen3-8B",
+            settings=None, target_outputs=None):
     summary = {
         "acceptance_length": length,
         "verify_count": verify,
@@ -87,7 +88,10 @@ def _record(length, *, data="d", prompt="p", verify=10, target="Qwen3-8B", setti
         "greedy_equal": True,
         "target_repeat_stable": True,
         "draft_repeat_stable": True,
-        "runs": {"speculative": {"summary": summary}},
+        "runs": {
+            "speculative": {"summary": summary},
+            "target_only": {"samples": target_outputs or [[{"output_ids": [1, 2]}]]},
+        },
     }
 
 
@@ -102,3 +106,8 @@ def test_ablation_summary_requires_matching_prompts_and_reports_delta():
         ablation.summarize(_record(2.4), _record(1.6, target="other"))
     with pytest.raises(ValueError, match="decoding settings differ"):
         ablation.summarize(_record(2.4), _record(1.6, settings={"samples": 8}))
+    with pytest.raises(ValueError, match="target-only outputs differ"):
+        ablation.summarize(
+            _record(2.4),
+            _record(1.6, target_outputs=[[{"output_ids": [1, 3]}]]),
+        )

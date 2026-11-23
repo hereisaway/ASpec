@@ -94,9 +94,11 @@ SGLang export maps Domino to the published layout
 (`architectures=["DFlashDraftModel"]`, `model_type="qwen3"`, nested
 `dflash_config.projector_type="domino"`) and preserves the trained `block_size`,
 `shift_label`, `pure_draft_prefix_len=1`, `emb_dim`, `gru_hidden_dim` and Target
-feature layers. Other label layouts fail closed and require the native format. The
-manifest records runtime `DFLASH`; SGLang 0.5.21 loads the exported
-`prefix_gru`/`embed_proj` tensors.
+feature layers. Omitted Domino fields are filled from `DominoConfig` defaults before
+conversion. Other label layouts fail closed and require the native format, as does
+`fc_norm=true` (SGLang would skip the per-layer normalization weights). The manifest
+records runtime `DFLASH`; SGLang 0.5.21 loads the exported `prefix_gru`/`embed_proj`
+tensors.
 
 The native manifest records the Domino algorithm, trained `block_size`, label layout,
 Target feature layers and the full training objective.
