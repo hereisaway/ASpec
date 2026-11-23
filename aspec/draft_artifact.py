@@ -381,8 +381,16 @@ class JetSpecConsumer:
         length = input_ids.shape[1]
         config = self.model.config
         width = config.target_hidden_size * config.num_target_layers
-        if target_features.shape != (1, length, width):
-            raise ValueError("Target features must match the asset's ordered layers and prefix")
+        if (target_features.ndim != 3 or target_features.shape[0] != 1
+                or target_features.shape[2] != width
+                or target_features.shape[1] not in {length, length - 1}):
+            raise ValueError(
+                "Target features must match the asset's ordered layers and prefix"
+            )
+        if target_features.shape[1] == length - 1:
+            # The verifier has sampled the anchor but not exposed its hidden
+            # state yet. The causal block mask hides that row anyway.
+            target_features = F.pad(target_features, (0, 0, 0, 1))
         if lm_head_weight.shape != (config.vocab_size, config.hidden_size):
             raise ValueError("Frozen Target output head shape does not match the Draft")
         if input_ids.device != target_features.device or input_ids.device != lm_head_weight.device:

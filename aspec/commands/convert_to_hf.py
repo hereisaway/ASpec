@@ -40,6 +40,7 @@ from typing_extensions import override
 
 from aspec.config.draft_algorithm import draft_model_semantics, resolve_draft_algorithm
 from aspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
+from aspec.models.draft.auto import normalize_published_draft_config
 from aspec.models.draft.keymap import to_export_keys
 
 logger = logging.getLogger(__name__)
@@ -391,11 +392,7 @@ def convert_checkpoint(
         raise ValueError("Export output directory must not overlap the source checkpoint or config")
 
     raw_config = json.loads(config_path.read_text(encoding="utf-8"))
-    nested = raw_config.get("dflash_config")
-    if isinstance(nested, dict) and nested.get("projector_type") == "domino":
-        from aspec.models.draft.domino import normalize_official_domino_config
-
-        raw_config = normalize_official_domino_config(raw_config)
+    raw_config = normalize_published_draft_config(raw_config)
     if artifact_format not in {"sglang", "aspec"}:
         raise ValueError("artifact_format must be sglang or aspec")
     if verify and artifact_format != "aspec":

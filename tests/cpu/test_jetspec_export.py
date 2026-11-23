@@ -111,6 +111,31 @@ def test_jetspec_native_export_roundtrips_every_tensor(tmp_path, monkeypatch):
         torch.testing.assert_close(warm.state_dict()[key], value, atol=0, rtol=0)
 
 
+
+def test_jetspec_native_export_accepts_published_layout_config(tmp_path, monkeypatch):
+    from aspec.models.draft.jetspec import official_jetspec_config
+
+    raw = _raw_config()
+    model = _model(raw)
+    _monkeypatch_checkpoint(monkeypatch, model)
+    source = _prepare_source(tmp_path, raw)
+    published = official_jetspec_config(raw)
+    config_path = tmp_path / "published_draft_config.json"
+    config_path.write_text(json.dumps(published))
+
+    manifest = convert_to_hf.convert_checkpoint(
+        input_dir=source,
+        output_dir=tmp_path / "asset",
+        config_path=config_path,
+        artifact_format="aspec",
+    )
+
+    assert manifest["algorithm"] == "jetspec"
+    assert manifest["training_contract"]["block_size"] == raw["block_size"]
+    assert manifest["draft_structure"]["loader_contract"]["proposal_entrypoint"] == (
+        "aspec.draft_artifact.JetSpecConsumer"
+    )
+
 def test_jetspec_native_export_rejects_semantics_that_disagree_with_checkpoint(
     tmp_path,
 ):

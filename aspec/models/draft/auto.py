@@ -43,6 +43,24 @@ from aspec.models.draft.mtp import NativeMTPConfig, NativeMTPDraftModel
 from aspec.utils.logging import logger
 
 
+def normalize_published_draft_config(raw: dict) -> dict:
+    """Convert known published nested draft layouts to ASpec's flat layout."""
+    if not isinstance(raw, dict):
+        return raw
+    nested = raw.get("dflash_config")
+    if not isinstance(nested, dict):
+        return raw
+    if nested.get("projector_type") == "domino":
+        from aspec.models.draft.domino import normalize_official_domino_config
+
+        return normalize_official_domino_config(raw)
+    if nested.get("causal_head") is True:
+        from aspec.models.draft.jetspec import normalize_official_jetspec_config
+
+        return normalize_official_jetspec_config(raw)
+    return raw
+
+
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
@@ -88,15 +106,7 @@ class AutoDraftModelConfig:
     def from_dict(cls, config: dict):
         config = dict(config)
 
-        nested = config.get("dflash_config")
-        if isinstance(nested, dict) and nested.get("projector_type") == "domino":
-            from aspec.models.draft.domino import normalize_official_domino_config
-
-            config = normalize_official_domino_config(config)
-        elif isinstance(nested, dict) and nested.get("causal_head") is True:
-            from aspec.models.draft.jetspec import normalize_official_jetspec_config
-
-            config = normalize_official_jetspec_config(config)
+        config = normalize_published_draft_config(config)
 
         if "tie_word_embeddings" in config and config.get("architectures") != ["MedusaDraftModel"]:
             logger.info("Set draft model tie_word_embeddings to False")

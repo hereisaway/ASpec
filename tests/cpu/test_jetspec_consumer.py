@@ -115,6 +115,16 @@ def test_jetspec_anchor_target_feature_is_hidden_from_the_block():
     torch.testing.assert_close(changed_tokens, baseline_tokens, atol=0, rtol=0)
 
 
+
+def test_jetspec_consumer_accepts_missing_anchor_feature():
+    model, ids, features, head = _setup()
+    consumer = JetSpecConsumer(model, block_size=model.config.block_size)
+
+    full = consumer.propose(ids, features, lm_head_weight=head)["token_ids"]
+    short = consumer.propose(ids, features[:, :-1], lm_head_weight=head)["token_ids"]
+
+    torch.testing.assert_close(short, full, atol=0, rtol=0)
+
 def test_jetspec_consumer_rejects_other_block_algorithms():
     from aspec.models.draft.dflash import DFlashDraftModel
 
