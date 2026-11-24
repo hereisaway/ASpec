@@ -120,6 +120,9 @@ def test_jetspec_native_export_accepts_published_layout_config(tmp_path, monkeyp
     _monkeypatch_checkpoint(monkeypatch, model)
     source = _prepare_source(tmp_path, raw)
     published = official_jetspec_config(raw)
+    # The published config carries these defaults explicitly.
+    published["hidden_act"] = "silu"
+    published["rope_scaling"] = None
     config_path = tmp_path / "published_draft_config.json"
     config_path.write_text(json.dumps(published))
 

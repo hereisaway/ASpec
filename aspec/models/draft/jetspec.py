@@ -120,6 +120,13 @@ def normalize_official_jetspec_config(raw: dict) -> dict:
     raw["target_num_hidden_layers"] = target_depth
     raw.pop("auto_map", None)
     raw.pop("max_window_layers", None)
+    # Match the bundled flat defaults so export compares effective semantics.
+    if raw.get("hidden_act") == "silu":
+        raw.pop("hidden_act", None)
+    if raw.get("rope_scaling") is None:
+        raw.pop("rope_scaling", None)
+    if raw.get("rope_parameters") is None:
+        raw.pop("rope_parameters", None)
     return raw
 
 
