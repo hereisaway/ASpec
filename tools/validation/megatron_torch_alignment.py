@@ -262,7 +262,7 @@ def source_identity(trainer, expected):
             "harness_sha256": file_sha(__file__)}
 
 
-def save_native_checkpoint(trainer, runtime, committed, fixture_sha, output, steps):
+def save_native_checkpoint(trainer, runtime, committed, fixture_sha, output, dataset_size):
     from aspec.training import checkpoint
 
     rank = dist.get_rank()
@@ -273,9 +273,33 @@ def save_native_checkpoint(trainer, runtime, committed, fixture_sha, output, ste
     if rank == 0:
         checkpoint.save_checkpoint_work_state(runtime.checkpoint_dir, trainer.global_step, {
             "committed_work_ids": committed, "dataset_fingerprint": "sha256:" + fixture_sha,
-            "dataset_size": steps * 2 * trainer.dp_size})
+            "dataset_size": dataset_size})
     dist.barrier()
     write_json(output / f"checkpoint-state-rank{rank}.json", local_state(trainer))
+
+
+def fixed_feature_row(samples, indices, length, work_id, collator):
+    if collator is None:
+        batch = {key: value[:, :length] if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+                 for key, value in samples[indices[0]].items()}
+        batch["_aspec_work"] = [{"execution_id": work_id}]
+        return batch
+
+    docs = []
+    for index in indices:
+        sample = samples[index]
+        if sample.get("attention_mask") is not None and not sample["attention_mask"].all():
+            raise ValueError("Packed alignment requires complete, unpadded fixture documents")
+        doc = {**sample, "_aspec_work": {"execution_id": f"{work_id}/sample-{index}"}}
+        if collator.cp_size > 1:
+            from aspec.inference.context import context_shard_bounds
+
+            lo, hi = context_shard_bounds(sample["input_ids"].shape[1], collator.cp_rank,
+                                          collator.cp_size, alignment=collator.cp_alignment)
+            for key in ("hidden_states", "last_hidden_states"):
+                doc[key] = sample[key][:, lo:hi]
+        docs.append(doc)
+    return collator(docs)
 
 
 def main():
@@ -289,12 +313,15 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference", type=Path, action="append", default=[])
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--cp", type=int, choices=(1, 2), default=1)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--megatron-grad-dtype", choices=("fp32", "bf16"))
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--stop-after", type=int, help="Stop at this update without shortening the LR horizon")
     parser.add_argument("--split-step", type=int, default=2)
     parser.add_argument("--length", type=int, default=4096)
+    parser.add_argument("--packed-pairs", action="store_true",
+                        help="Pack adjacent pairs of complete fixture documents with per-document anchor budgets")
     parser.add_argument("--anchors", type=int, default=512)
     parser.add_argument("--tensor-steps", default="all", help="Full gradient/update observations: all or comma-separated steps")
     parser.add_argument("--state-steps", default="", help="Model/master/moment observations: comma-separated steps")
@@ -303,10 +330,21 @@ def main():
     parser.add_argument("--attention-backend", choices=("fa4", "cudnn_flex_attention"), default="cudnn_flex_attention")
     parser.add_argument("--attention-backward-deterministic", action="store_true",
                         help="Require native deterministic cuDNN-FE attention backward on every rank")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Require deterministic PyTorch algorithms and native cuDNN attention backward")
     args = parser.parse_args()
+    if args.deterministic:
+        args.attention_backward_deterministic = True
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     if args.steps < 1 or (args.phase in {"split", "checkpoint-control"}
                           and not 1 <= args.split_step <= args.steps):
         parser.error("Require positive steps and a split within the training horizon")
+    if args.cp > 1 and not args.packed_pairs:
+        parser.error("CP2 alignment requires packed fixture documents")
+    if args.packed_pairs and args.tp != 1:
+        parser.error("Packed fixed-feature alignment currently requires TP1")
     if args.backend == "fsdp" and args.tp != 1:
         parser.error("The Torch baseline uses its existing TP1 execution")
     if args.backend != "megatron" and args.megatron_grad_dtype is not None:
@@ -365,7 +403,7 @@ def run(args, *, attention_calls=None):
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", device_id=torch.device("cuda", torch.cuda.current_device()))
     init_gloo_group()
-    init_direct_cp_groups(1)
+    init_direct_cp_groups(args.cp)
     rank, world = dist.get_rank(), dist.get_world_size()
     output = args.output.resolve()
     if rank == 0:
@@ -376,7 +414,8 @@ def run(args, *, attention_calls=None):
     base_backend = "fsdp" if args.backend == "torch-tp" else args.backend
     overrides = [f"model.target_model_path={args.model}",
                  f"model.draft_model_config={args.source / 'aspec/config/dspark_draft_config.json'}",
-                 f"training.train_backend={base_backend}", "training.dflash_packing=false",
+                 f"training.draft_context_parallel_size={args.cp}", f"training.train_backend={base_backend}",
+                 f"training.dflash_packing={str(args.packed_pairs).lower()}",
                  f"training.training_num_gpus_per_node={world}", "training.draft_accumulation_steps=2",
                  "training.deterministic_anchor_sampling=true", f"training.max_seq_length={args.length}",
                  f"training.dspark_num_anchors={args.anchors}", f"training.num_train_steps={args.steps}",
@@ -384,6 +423,8 @@ def run(args, *, attention_calls=None):
                  "inference.target_prefill_memory_optimized=true",
                  "mooncake.source_gpu_ring_slots=12", "mooncake.destination_gpu_ring_slots=3",
                  f"output_dir={output}"]
+    if args.packed_pairs:
+        overrides.append("training.anchor_sampling_scope=sample")
     if args.initial:
         overrides.append(f"model.initial_draft_model_path={args.initial}")
     if args.resume:
@@ -463,6 +504,30 @@ def run(args, *, attention_calls=None):
                 "dp_size": trainer.dp_size, "seed": runtime.seed,
                 "learning_rate": runtime.learning_rate, "warmup_ratio": runtime.warmup_ratio,
                 "objective_weights": [trainer.ce_loss_alpha, trainer.l1_loss_alpha, trainer.confidence_head_alpha]}
+    if args.deterministic:
+        manifest["deterministic_algorithms"] = torch.are_deterministic_algorithms_enabled()
+        manifest["deterministic_cudnn"] = torch.backends.cudnn.deterministic
+    collator = None
+    docs_per_row = 1
+    if args.packed_pairs:
+        from aspec.data.utils import DFlashPackingCollator
+
+        if len(samples) < 2 or len(samples) % 2:
+            raise ValueError("Packed alignment requires an even number of complete fixture documents")
+        docs_per_row = 2
+        collator = DFlashPackingCollator(args.length, pad_to_max_length=False,
+                                         context_parallel_rank=trainer.cp_rank, context_parallel_size=args.cp,
+                                         context_shard_alignment=getattr(runtime, "draft_context_shard_alignment", 1))
+        if trainer.cp_size != args.cp or trainer.dp_size * args.cp != world:
+            raise RuntimeError("Observed Draft topology does not match the packed comparison")
+        if args.cp > 1:
+            manifest["cp_size"] = args.cp
+        manifest["packed_documents_per_row"] = docs_per_row
+    if args.resume:
+        prior = json.loads((args.resume.parent.parent / "run-manifest.json").read_text())
+        if prior.get("packed_documents_per_row", 1) != docs_per_row:
+            raise ValueError("Resume requires the original fixture packing policy")
+
     if rank == 0:
         write_json(output / "run-manifest.json", manifest)
         write_json(output / "runtime-config.json", json.loads(json.dumps(vars(runtime), default=str)))
@@ -472,7 +537,7 @@ def run(args, *, attention_calls=None):
                 raise RuntimeError("Compared trajectories differ in fixed inputs or training contract")
     trainable = named_trainable(trainer)
     publish = trainer.dp_rank == 0
-    writer = publish and getattr(trainer, "tp_rank", 0) == 0
+    writer = publish and getattr(trainer, "tp_rank", 0) == 0 and trainer.cp_rank == 0
     if args.phase != "resume" and publish:
         logical = logical_optimizer_state(trainer)
         if writer:
@@ -521,26 +586,49 @@ def run(args, *, attention_calls=None):
         if not trainer.global_step < args.stop_after <= stop:
             raise ValueError("stop-after must follow the initial step and stay within the declared horizon")
         stop = args.stop_after
+    dataset_size = args.steps * 2 * trainer.dp_size * docs_per_row
     while trainer.global_step < stop:
         step = trainer.global_step + 1
         observation.update(terms=[], anchors=[], gradients={}, before={})
         batches = []
-        for micro in range(2):
-            index = ((step - 1) * 2 * trainer.dp_size + micro * trainer.dp_size + trainer.dp_rank) % len(samples)
-            batch = {key: value[:, :args.length] if isinstance(value, torch.Tensor) else copy.deepcopy(value)
-                     for key, value in samples[index].items()}
-            batch["_aspec_work"] = [{"execution_id": f"window-{step}/dp-{trainer.dp_rank}/micro-{micro}"}]
-            batches.append(batch)
+        indices_by_replica = {}
+        issued = []
+        for replica in range(trainer.dp_size):
+            indices_by_replica[str(replica)] = []
+            for micro in range(2):
+                row = (step - 1) * 2 * trainer.dp_size + micro * trainer.dp_size + replica
+                indices = [(row * docs_per_row + doc) % len(samples) for doc in range(docs_per_row)]
+                indices_by_replica[str(replica)].extend(indices)
+                work_id = f"window-{step}/dp-{replica}/micro-{micro}"
+                if args.packed_pairs:
+                    issued.extend(f"{work_id}/sample-{index}" for index in indices)
+                else:
+                    issued.append(work_id)
+                if replica == trainer.dp_rank:
+                    batches.append(fixed_feature_row(samples, indices, args.length, work_id, collator))
         trainer.data_fetcher = batches
         metrics = trainer._train_core_from_queue(step=step - 1, num_batches=2)
         if hasattr(metrics, "finalize"):
             metrics = metrics.finalize()
+        if args.packed_pairs:
+            layers = trainer.draft_model.last_attention_observations
+            if len(layers) != len(trainer.draft_model.layers) or not all(
+                layer.get("qkv_format") == "thd" and layer.get("kernel_backend", "fa4") == args.attention_backend
+                and layer.get("context_parallel_size") == args.cp
+                and layer.get("context_parallel_rank") == trainer.cp_rank
+                and layer.get("backward_observed") for layer in layers
+            ):
+                raise RuntimeError(f"Missing packed THD forward/backward evidence on rank {rank}: {layers}")
+            write_json(output / f"thd-step{step}-rank{rank}.json", layers)
         local_work = trainer.pop_committed_work(step)
         participants = [None] * world
         dist.all_gather_object(participants, local_work)
+        if args.cp > 1:
+            for first in range(0, world, args.cp):
+                if any(work != participants[first] for work in participants[first:first + args.cp]):
+                    raise RuntimeError("CP ranks consumed different packed documents")
+            participants = participants[::args.cp]
         new_work = [item for replica in participants for item in replica]
-        issued = [f"window-{step}/dp-{replica}/micro-{micro}"
-                  for replica in range(trainer.dp_size) for micro in range(2)]
         if sorted(new_work) != sorted(issued) or set(new_work).intersection(committed):
             raise RuntimeError("Committed work was duplicated or omitted")
         committed.extend(new_work)
@@ -549,7 +637,8 @@ def run(args, *, attention_calls=None):
         anchors = [{"positions": tensor_record(a), "keep": tensor_record(k)} for a, k in observation["anchors"]]
         write_json(output / f"anchors-step{step}-rank{rank}.json", anchors)
         participant_anchors = [None] * world
-        dist.all_gather_object(participant_anchors, {"replica": trainer.dp_rank, "anchors": anchors})
+        replica_key = f"{trainer.dp_rank}/cp{trainer.cp_rank}" if args.cp > 1 else trainer.dp_rank
+        dist.all_gather_object(participant_anchors, {"replica": replica_key, "anchors": anchors})
         by_replica = {}
         for participant in participant_anchors:
             replica = str(participant["replica"])
@@ -572,10 +661,7 @@ def run(args, *, attention_calls=None):
                       "anchors": anchors, "anchors_by_replica": by_replica,
                       "metrics": metrics, "comparisons": {},
                       "full_tensor_observation": step in tensor_steps,
-                      "fixture_sample_indices_by_replica": {
-                          str(replica): [((step - 1) * 2 * trainer.dp_size + micro * trainer.dp_size + replica)
-                                         % len(samples) for micro in range(2)]
-                          for replica in range(trainer.dp_size)}}
+                      "fixture_sample_indices_by_replica": indices_by_replica}
             if args.save_reference_tensors and step in tensor_steps and args.phase in {"uninterrupted", "checkpoint-control"}:
                 torch.save(vectors, output / f"vectors-step{step}.pt")
             for reference in args.reference:
@@ -635,10 +721,10 @@ def run(args, *, attention_calls=None):
         del updates, batches
         dist.barrier()
         if args.phase == "checkpoint-control" and step == args.split_step:
-            save_native_checkpoint(trainer, runtime, committed, fixture_sha, output, args.steps)
+            save_native_checkpoint(trainer, runtime, committed, fixture_sha, output, dataset_size)
 
     if args.phase == "split":
-        save_native_checkpoint(trainer, runtime, committed, fixture_sha, output, args.steps)
+        save_native_checkpoint(trainer, runtime, committed, fixture_sha, output, dataset_size)
     write_json(output / f"final-state-rank{rank}.json", local_state(trainer))
     if trainer.global_step == args.steps and publish and args.steps not in state_steps:
         logical = logical_optimizer_state(trainer)

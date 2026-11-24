@@ -2,10 +2,18 @@
 
 ASpec supports the public Megatron Core 0.20.0 API
 (`core_v0.20.0`, revision `685fb8bd970185e9ac3283fe32a5d6667bf4b268`).
-Select the Target and Draft independently. The validated configuration uses
-Qwen3-8B prefill and dense full-attention DSpark, BF16, microbatch size one,
-single-node CP1/PP1, and TP1 or TP2. The Megatron Draft supports DP replicas.
-Shared Target, decode, MTP conditioning and Megatron Draft packing are outside
+Select the Target and Draft independently. Qwen3-8B prefill and dense DSpark
+use BF16, microbatch size one and single-node PP1. At CP1 the Target and
+unpacked Draft support TP1 or TP2. The Megatron Draft supports DP replicas.
+Packed DSpark training uses Draft TP1 with `training.dflash_packing=true`,
+`training.anchor_sampling_scope=sample`, and a THD attention backend
+(`cudnn_flex_attention` or `fa4`). The controller assigns complete documents
+to each row. The collator resets positions at document boundaries and retains
+each document's supervision mask and work ID. Fixed-feature and live SGLang
+comparisons cover CP1 and CP2 with cuDNN. For CP2, select the SGLang Target configuration and
+set `training.draft_context_parallel_size=2`. Two Draft GPUs form one replica.
+Each rank reads its own Target feature shard over NVLink.
+Shared Target, decode and MTP conditioning are outside
 this configuration.
 
 ## Dependency profiles
@@ -108,7 +116,7 @@ and the Core DDP flag. Exact resume preserves this setting; checkpoints without
 the field are interpreted as FP32. Changing gradient precision requires
 a weights-only new stage rather than an exact continuation.
 
-One TP leader prefetches source GETs into bounded, preallocated destination rings.
+For unpacked training, one TP leader prefetches source GETs into bounded, preallocated destination rings.
 TP broadcasts and collation run on the consumer thread between microbatches, in
 the same order as model collectives. Availability and tensor metadata use a CPU
 Gloo group; no background reader launches NCCL work. Training and evaluation own
@@ -119,7 +127,7 @@ occurs once per DP replica. Anchors/keep masks are shared from the TP leader;
 commit collection checks matching work identity and reports it once per replica.
 
 Gradients are normalized by the complete optimizer window's supervision weight,
-pooled across DP. TP-partial Q/K norm gradients are reduced once, and clipping
+pooled across data and context ranks. TP-partial Q/K norm gradients are reduced once, and clipping
 counts each replicated parameter once. Checkpoints describe logical TP shards and
 restore model, FP32 masters, moments, schedule and both ASpec and Core RNG streams.
 Exact resume requires the same Draft backend, TP topology and world size. Cross-backend weights-only
@@ -158,6 +166,16 @@ verification tool uses a native PyTorch DTensor adapter around the existing
 DSpark trainer and optimizer. This adapter is available only in the validation
 tool. The public Torch training entry point supports TP1.
 
+For a TP1 packed comparison, pass `--packed-pairs` to both runs of
+`megatron_torch_alignment.py`. Supply an even number of complete, unpadded
+documents in the teacher cache. Each adjacent pair must fit within `--length`.
+For CP2, add `--cp 2` and launch two workers per data replica on both backends.
+Each worker reads its context shard from each document before collation.
+For a strict cuDNN comparison, set `CUBLAS_WORKSPACE_CONFIG=:4096:8` and pass
+`--deterministic` to both training runs.
+The driver checks that each document is committed once, compares anchors,
+loss denominators and optimizer updates, and records THD backward evidence.
+
 Run the following Bash commands from the checkout. Supply the role venvs, model,
 SGLang feature cache and an empty output root. The same backend that wrote a
 checkpoint also supplies its uninterrupted replay reference.
@@ -182,7 +200,29 @@ fixed_run() {
     --source "$src" --model "$model" --teacher "$teacher" "$@"
 }
 fixed_run "$torch_env" 0 1 --backend fsdp --tp 1 --phase prepare --output "$out/initial"
+```
 
+For the packed Draft comparison, use a cache whose adjacent document pairs
+fit within 1,024 tokens. Run each backend on the same devices in sequence.
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+for cp in 1 2; do
+  devices=0
+  if [[ $cp == 2 ]]; then devices=0,1; fi
+  common=(--tp 1 --cp "$cp" --packed-pairs --length 1024 --anchors 32
+          --steps 100 --deterministic --phase uninterrupted
+          --tensor-steps 1,50,100 --state-steps 100 --initial "$out/initial/model.safetensors")
+  reference="$out/torch-packed-cp$cp"
+  fixed_run "$torch_env" "$devices" "$cp" --backend fsdp "${common[@]}" --output "$reference"
+  fixed_run "$meg_env" "$devices" "$cp" --backend megatron --megatron-grad-dtype bf16 \
+    "${common[@]}" --reference "$reference" --no-save-reference-tensors --output "$out/megatron-packed-cp$cp"
+done
+```
+
+For the unpacked TP2 checkpoint and resume comparison, run:
+
+```bash
 for dp in 1 2; do
   devices=0,1
   milestones=1,2,5,10,20,30,40,50,60,70,80,90,100
@@ -213,6 +253,54 @@ The control saves after update 50 and continues to 100. The fresh processes
 compare the remaining updates with their respective controls. Each run records
 the backward policy on every rank, the loss components and gradient norm at every
 update, and logical gradients and optimizer state at the requested milestones.
+
+For an online packed comparison, give both Drafts the same pretokenized Parquet
+file and initial weights. SGLang computes the features from the token IDs on
+each run. Use short documents that fit together within a 1,024-token row.
+The example uses three GPUs for one SGLang Target and a two-rank CP Draft.
+For CP1, set `cp=1` and `devices=0,1`.
+
+```bash
+sgl_target=/absolute/path/to/sglang-target-venv/bin/python
+train=/absolute/path/to/train.parquet
+cp=2
+devices=0,1,2
+online=(--model "$model" --initial "$out/initial/model.safetensors" --train-data "$train"
+        --target-python "$sgl_target" --cp "$cp" --steps 100)
+for draft in torch megatron; do
+  env_dir=$torch_env
+  reference=()
+  if [[ $draft == megatron ]]; then
+    env_dir=$meg_env
+    reference=(--reference "$out/online-packed-torch-cp$cp")
+  fi
+  VIRTUAL_ENV="$env_dir" PATH="$env_dir/bin:$PATH" CUDA_VISIBLE_DEVICES="$devices" \
+    "$env_dir/bin/python" -m aspec._environment "$env_dir/bin/python" \
+    -m tools.validation.megatron_packed_online "${online[@]}" --draft "$draft" \
+    "${reference[@]}" --output "$out/online-packed-$draft-cp$cp"
+done
+```
+
+For each context rank and microbatch, the comparison checks the sequence of
+document lengths and the hashes of the packed token IDs, loss mask and received
+Target hidden states against Torch. It also checks the anchor seed and
+supervision weight, plus the context positions at CP2. It pools the
+objective over both microbatches and all context shards before computing the
+per-step relative difference against Torch in `objectives.json`.
+
+On SM100, a live Qwen3-8B SGLang TP1 Target computed features from 16
+Alpaca GPT-4 Chinese conversations. Each run consumed 200 packed rows of two
+documents, accumulated two rows per update, and saved a checkpoint at update
+100. Both Drafts used BF16 gradients and deterministic cuDNN THD backward.
+
+| Draft topology | Torch mean objective | Megatron mean objective | Max absolute per-step rel diff | NVLink reads per run |
+| --- | ---: | ---: | ---: | ---: |
+| TP1/CP1/DP1 | 2.77931555 | 2.77931555 | 0% | 400 |
+| TP1/CP2/DP1 | 2.76814709 | 2.76814709 | 0% | 800 |
+
+All reads were released and each rank recorded 1,000 deterministic attention
+backward calls. The [per-step objectives](../benchmarks/megatron-packed-online.csv)
+include the signed relative difference against the same-topology Torch run.
 
 For Target comparison, run `tools/validation/megatron_target_aspec_alignment.py`
 with `torchrun` in the Megatron environment:
