@@ -265,6 +265,12 @@ def _load_draft_descriptor(config: DictConfig) -> dict[str, Any]:
         raise PlanCompileError(f"Cannot read draft model config {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise PlanCompileError(f"Draft model config must contain a JSON object: {path}")
+    from aspec.models.draft.auto import normalize_published_draft_config
+
+    try:
+        raw = normalize_published_draft_config(raw)
+    except (ValueError, TypeError) as exc:
+        raise PlanCompileError(str(exc)) from exc
 
     architectures = raw.get("architectures")
     if not isinstance(architectures, list) or len(architectures) != 1:

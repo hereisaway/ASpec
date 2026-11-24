@@ -108,6 +108,23 @@ def test_sglang_serving_export_rejects_jetspec():
         _serving_config(raw)
 
 
+
+def test_plan_accepts_published_jetspec_layout(tmp_path):
+    from aspec.models.draft.jetspec import official_jetspec_config
+
+    raw = json.loads(_DRAFT_JSON.read_text())
+    published = official_jetspec_config(raw)
+    config_path = tmp_path / "published_draft_config.json"
+    config_path.write_text(json.dumps(published))
+    config, args = _config(tmp_path, f"model.draft_model_config={config_path}")
+
+    plan = compile_execution_plan(
+        config, config_path=str(_EXAMPLE), cli_args=args
+    ).to_dict()
+
+    assert plan["workload"]["models"]["draft"]["family"] == "jetspec"
+    assert plan["workload"]["features"]["aux_hidden_state_layers"] == raw["target_layer_ids"]
+
 def test_plan_compiles_with_jetspec_objective(tmp_path):
     config, args = _config(tmp_path)
     plan = compile_execution_plan(config, config_path=str(_EXAMPLE), cli_args=args).to_dict()
