@@ -126,9 +126,10 @@ SGLang 0.5.21 needs the exported config to carry top-level `is_causal=true`; the
 published `dflash_config.causal_head` field alone leaves DFlash full-attention layers
 bidirectional. The evaluator checks greedy equality against Target-only decoding and
 repeat stability, and reports acceptance length including Target tokens. Exporting the
-published `JetSpec/jetspec-qwen3-8b` checkpoint through ASpec reproduced the direct
-checkpoint's bounded acceptance and fixed-order timing; this is a decode integration check, not
-throughput or convergence evidence.
+published `JetSpec/jetspec-qwen3-8b` checkpoint with
+`python -m tools.validation.jetspec_published_export --checkpoint ... --target-model ...`
+reproduced the direct checkpoint's bounded acceptance and fixed-order timing; this is a
+decode integration check, not throughput or convergence evidence.
 
 ## Algorithm, capacity and fault checks
 
