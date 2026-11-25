@@ -127,7 +127,7 @@ published `dflash_config.causal_head` field alone leaves DFlash full-attention l
 bidirectional. The evaluator checks greedy equality against Target-only decoding and
 repeat stability, and reports acceptance length including Target tokens. Exporting the
 published `JetSpec/jetspec-qwen3-8b` checkpoint through ASpec reproduced the direct
-checkpoint's bounded acceptance and speedup; this is a decode integration check, not
+checkpoint's bounded acceptance and fixed-order timing; this is a decode integration check, not
 throughput or convergence evidence.
 
 ## Algorithm, capacity and fault checks

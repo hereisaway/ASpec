@@ -27,13 +27,18 @@ SGLang 0.5.21 reads the top-level `is_causal` flag for DFlash full-attention lay
 | Published checkpoint exported through ASpec | 2.723 | 376 | 1.823x | yes | yes |
 
 Acceptance length follows `aspec evaluate`: completion tokens divided by real
-verifier calls, including Target tokens. Both runs produced 512 completion tokens
-across two repeats.
+verifier calls, including Target tokens. Each repeat produced 512 completion tokens;
+the two repeats produced 1024 tokens total, which is the numerator used above.
 
 The ASpec-exported published checkpoint matched the directly loaded checkpoint's
 acceptance length, verification count and speedup in this bounded setup. That checks
 config/weight/layout compatibility; it does not establish convergence or a trained
 quality comparison.
+
+Timing is fixed-order: the evaluator completes all Target-only repeats before all
+speculative repeats. Two repeats do not counterbalance that order, so the speedup
+column is a bounded decode observation with an uncontrolled order-dependent
+limitation, not an unbiased throughput result.
 
 The 8-step ASpec checkpoint was trained only as a functional smoke test on synthetic
 data. Its lower acceptance and slower speculative decode are expected and are not
@@ -51,5 +56,10 @@ CUDA_VISIBLE_DEVICES=0 aspec evaluate \
   --samples 16 --max-new-tokens 32 --repeats 2
 ```
 
-The published checkpoint can be exported through ASpec with the same command after
-converting its config with `AutoDraftModelConfig.from_dict`.
+The command above applies to an ASpec FSDP training checkpoint. The published
+checkpoint comparison used a local conversion harness because `convert_checkpoint`
+expects a distributed-checkpoint layout (`model/.metadata`): the harness loaded the
+published tensors into an ASpec draft model through `load_initial_draft_weights`,
+wrote a stub checkpoint (`model/.metadata`, `draft_config.json`, `meta.json`), and
+then called `convert_checkpoint(..., artifact_format="sglang")`. Converting only the
+config is not sufficient.

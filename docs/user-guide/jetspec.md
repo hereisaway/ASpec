@@ -146,7 +146,7 @@ coverage, including causal visibility and anchor-feature isolation. GPU attentio
 execution, convergence and serving throughput are not certified by those checks.
 Bounded SGLang decode was run on 16 held-out prompts (32 new tokens, greedy, two
 repeats): the 8-step checkpoint produced greedy-equal, repeat-stable output. The published `JetSpec/jetspec-qwen3-8b` checkpoint measured 2.723
-tokens/verification and 1.823x median speedup in the same bounded setup; exporting
+tokens/verification and 1.823x fixed-order median speedup in the same bounded setup; exporting
 that checkpoint through ASpec reproduced the same numbers, confirming tensor/layout
 compatibility. The 8-step checkpoint measured 1.032
 tokens/verification and 0.795x, so this is not a convergence or quality claim. See
