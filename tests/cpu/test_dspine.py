@@ -12,7 +12,7 @@ from aspec.models.draft.dspine import (
     DSpineDraftModel,
     DSpineOptions,
 )
-from aspec.models.dspine import DSpineModel
+from aspec.models.dspine import DSpineModel, refinement_loss
 
 
 def make_config(**overrides):
@@ -126,6 +126,85 @@ def test_adjacent_injection_does_not_leak_future_tokens_backwards():
 
     torch.testing.assert_close(first[..., :-1, :], second[..., :-1, :], atol=0, rtol=0)
     assert not torch.equal(first[..., -1, :], second[..., -1, :])
+
+
+def _reference_injection(injection, hidden, layer, token_ids, codes, replace):
+    import math
+
+    import torch.nn.functional as F
+
+    features = injection.feature(hidden, layer)
+    anchor = math.sqrt(injection.rank) * F.embedding(token_ids[..., :1], codes)
+    predecessors = torch.cat((anchor, features[..., 1:-1, :]), dim=-2)
+    if replace is not None and layer < injection.replacement_layers:
+        correct = math.sqrt(injection.rank) * F.embedding(token_ids[..., :-1], codes)
+        predecessors = torch.where(replace[..., None, None], correct, predecessors)
+    gate = torch.sigmoid(
+        injection.receiver_gate(features[..., 1:, :])
+        + injection.predecessor_gate(predecessors)
+        + injection.bias
+    )
+    delta = injection.writes[layer](gate * injection.message(predecessors))
+    scale = (
+        torch.linalg.vector_norm(hidden[..., 1:, :].float(), dim=-1, keepdim=True)
+        / math.sqrt(hidden.shape[-1])
+    ).to(hidden.dtype)
+    return torch.cat((hidden[..., :1, :], hidden[..., 1:, :] + scale * delta), dim=-2)
+
+
+def test_adjacent_injection_matches_independent_equation():
+    options = DSpineOptions(
+        transfer_rank=8, message_size=8, top_k=4,
+        alignment_warmup_steps=0, replacement_layers=1,
+        replacement_probability=0.0,
+    )
+    injection = AdjacentInjection(16, 2, options)
+    generator = torch.Generator().manual_seed(19)
+    hidden = torch.randn(1, 2, 4, 16, generator=generator)
+    token_ids = torch.randint(0, 32, (1, 2, 4), generator=generator)
+    codes = torch.randn(32, 8, generator=generator)
+    replace = torch.tensor([[True, False]])
+
+    actual = injection(hidden, 0, token_ids, codes, replace)
+    expected = _reference_injection(injection, hidden, 0, token_ids, codes, replace)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_refine_matches_independent_equation():
+    model = make_model()
+    model.draft_model.initialize_transfer_space(torch.randn(32, 16))
+    generator = torch.Generator().manual_seed(23)
+    hidden = torch.randn(1, 2, 3, 16, generator=generator)
+    predecessors = torch.randint(0, 32, (1, 2, 3), generator=generator)
+    layer = len(model.draft_model.layers) - 1
+    actual = model.draft_model.refine(hidden, predecessors)
+    import math
+
+    import torch.nn.functional as F
+
+    receiver = model.draft_model.injection.feature(hidden, layer)
+    codes = math.sqrt(model.draft_model.injection.rank) * F.embedding(
+        predecessors, model.draft_model.transfer_codes
+    )
+    expected = model.draft_model.final_norm(
+        model.draft_model.injection.write(hidden, receiver, codes, layer)
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_refinement_loss_is_zero_for_equal_candidate_distributions():
+    scores = torch.tensor([[[2.0, 1.0, 0.0], [2.0, 1.0, 0.0]]])
+    target = torch.softmax(scores, dim=-1)
+    candidates = torch.tensor([[[4, 5, 6], [4, 5, 6]]])
+    labels = torch.tensor([[4, 4]])
+    weights = torch.ones_like(labels, dtype=torch.float32)
+    refinement, ref_ce, ref_l1 = refinement_loss(
+        scores=scores, candidates=candidates, target_candidates=target,
+        proposal_labels=labels, proposal_weights=weights,
+        ce_weight=0.1, mass_threshold=1e-4,
+    )
+    assert ref_l1 == 0
+    torch.testing.assert_close(refinement, 0.1 * ref_ce)
 
 
 def test_packed_inputs_are_rejected_before_backbone():

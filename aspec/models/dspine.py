@@ -21,6 +21,30 @@ from aspec.models.dflash import (
 from aspec.models.ops.flex_attention import compile_friendly_create_block_mask
 
 
+def refinement_loss(
+    *, scores: torch.Tensor, candidates: torch.Tensor,
+    target_candidates: torch.Tensor, proposal_labels: torch.Tensor,
+    proposal_weights: torch.Tensor, ce_weight: float, mass_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Candidate CE/L1 with the reference normalization and coverage mask."""
+    mass = target_candidates.sum(-1)
+    covered = candidates == proposal_labels.unsqueeze(-1)
+    covered_any = covered.any(-1)
+    ref_ce = F.cross_entropy(
+        scores.reshape(-1, candidates.shape[-1]),
+        covered.long().argmax(-1).reshape(-1),
+        reduction="none",
+    ).reshape(proposal_labels.shape)
+    ref_ce = (ref_ce * covered_any * proposal_weights).sum()
+    normalized_target = target_candidates / mass.clamp_min(1e-12).unsqueeze(-1)
+    ref_l1 = (
+        (torch.softmax(scores, dim=-1) - normalized_target).abs().sum(-1)
+        * (mass > mass_threshold)
+        * proposal_weights
+    ).sum()
+    return ce_weight * ref_ce + (1 - ce_weight) * ref_l1, ref_ce, ref_l1
+
+
 class DSpineModel(DFlashModel):
     """Block-parallel DFlash backbone with adjacent injection and refinement."""
 
@@ -225,22 +249,15 @@ class DSpineModel(DFlashModel):
         candidate_embeds = F.embedding(candidates, lm_head_weight)
         scores = (refined.unsqueeze(-2) * candidate_embeds).sum(-1).float()
         target_candidates = teacher_probs.gather(-1, candidates)
-        mass = target_candidates.sum(-1)
-        covered = candidates == proposal_labels.unsqueeze(-1)
-        covered_any = covered.any(-1)
-        ref_ce = F.cross_entropy(
-            scores.reshape(-1, config.top_k),
-            covered.long().argmax(-1).reshape(-1),
-            reduction="none",
-        ).reshape(proposal_labels.shape)
-        ref_ce = (ref_ce * covered_any * proposal_weights).sum()
-        normalized_target = target_candidates / mass.clamp_min(1e-12).unsqueeze(-1)
-        ref_l1 = (
-            (torch.softmax(scores, dim=-1) - normalized_target).abs().sum(-1)
-            * (mass > config.candidate_mass_threshold)
-            * proposal_weights
-        ).sum()
-        refinement = config.ce_weight * ref_ce + (1 - config.ce_weight) * ref_l1
+        refinement, ref_ce, ref_l1 = refinement_loss(
+            scores=scores,
+            candidates=candidates,
+            target_candidates=target_candidates,
+            proposal_labels=proposal_labels,
+            proposal_weights=proposal_weights,
+            ce_weight=config.ce_weight,
+            mass_threshold=config.candidate_mass_threshold,
+        )
 
         reference_codes = F.embedding(
             proposal_labels, self.draft_model.transfer_codes
