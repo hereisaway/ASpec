@@ -166,9 +166,36 @@ def test_jetspec_native_export_rejects_block_size_that_disagrees_with_checkpoint
         )
 
 
-def test_jetspec_has_no_serving_export():
-    with pytest.raises(NotImplementedError, match="--format aspec"):
-        convert_to_hf._serving_config(_raw_config())
+def test_jetspec_serving_export_uses_causal_dflash_layout():
+    config = convert_to_hf._serving_config(_raw_config())
+
+    assert config["architectures"] == ["DFlashDraftModel"]
+    assert config["model_type"] == "qwen3"
+    assert config["is_causal"] is True
+    assert config["block_size"] == 5
+    assert config["num_target_layers"] == 6
+    assert config["dflash_config"]["causal_head"] is True
+    assert config["dflash_config"]["target_layer_ids"] == [1, 4]
+    assert config["dflash_config"]["mask_token_id"] == 31
+
+
+def test_jetspec_sglang_export_manifest_uses_dflash_runtime(tmp_path, monkeypatch):
+    raw = _raw_config()
+    _monkeypatch_checkpoint(monkeypatch, _model(raw))
+    source = _prepare_source(tmp_path, raw)
+    output = tmp_path / "sglang-asset"
+
+    manifest = convert_to_hf.convert_checkpoint(
+        input_dir=source, output_dir=output, artifact_format="sglang"
+    )
+
+    assert manifest["storage_format"] == "sglang"
+    assert manifest["algorithm"] == "jetspec"
+    assert manifest["draft_structure"]["loader_contract"]["speculative_algorithm"] == "DFLASH"
+    exported = json.loads((output / "config.json").read_text())
+    assert exported["architectures"] == ["DFlashDraftModel"]
+    assert exported["is_causal"] is True
+    assert exported["dflash_config"]["causal_head"] is True
 
 
 def _write_config(tmp_path, raw):
