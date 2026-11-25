@@ -56,10 +56,18 @@ CUDA_VISIBLE_DEVICES=0 aspec evaluate \
   --samples 16 --max-new-tokens 32 --repeats 2
 ```
 
-The command above applies to an ASpec FSDP training checkpoint. The published
-checkpoint comparison used a local conversion harness because `convert_checkpoint`
-expects a distributed-checkpoint layout (`model/.metadata`): the harness loaded the
-published tensors into an ASpec draft model through `load_initial_draft_weights`,
-wrote a stub checkpoint (`model/.metadata`, `draft_config.json`, `meta.json`), and
-then called `convert_checkpoint(..., artifact_format="sglang")`. Converting only the
-config is not sufficient.
+The command above applies to an ASpec FSDP training checkpoint. For the published
+draft head, use the reproducible validation harness:
+
+```bash
+python -m tools.validation.jetspec_published_export \
+  --checkpoint /models/jetspec-qwen3-8b \
+  --target-model /models/Qwen3-8B \
+  --output outputs/jetspec-official-sglang
+```
+
+The harness loads the published tensors through `load_initial_draft_weights`, writes
+the minimal distributed-checkpoint layout the converter expects, and calls
+`convert_checkpoint(..., artifact_format="sglang")`. The published checkpoint omits
+`embed_tokens`, so `--target-model` supplies the borrowed embedding; converting only
+the config is not sufficient.
