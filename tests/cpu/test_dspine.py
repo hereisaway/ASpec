@@ -13,6 +13,7 @@ from aspec.models.draft.dspine import (
     DSpineOptions,
 )
 from aspec.models.dspine import DSpineModel, refinement_loss
+from aspec.models.ops.anchors import sample_anchor_positions
 
 
 def make_config(**overrides):
@@ -116,17 +117,24 @@ def test_adjacent_injection_does_not_leak_future_tokens_backwards():
     injection = AdjacentInjection(16, 1, options)
     _randomize_injection(injection)
     generator = torch.Generator().manual_seed(11)
-    hidden = torch.randn(1, 4, 16, generator=generator)
-    token_ids = torch.randint(0, 32, (1, 4), generator=generator)
+    hidden = torch.randn(1, 1, 4, 16, generator=generator)
+    token_ids = torch.randint(0, 32, (1, 1, 4), generator=generator)
     codes = torch.randn(32, 8, generator=generator)
 
-    first = injection(hidden, 0, token_ids, codes)
+    replace = torch.ones(1, 1, dtype=torch.bool)
+    first = injection(hidden, 0, token_ids, codes, replace)
     changed = hidden.clone()
     changed[..., -1, :] += 10.0
-    second = injection(changed, 0, token_ids, codes)
+    second = injection(changed, 0, token_ids, codes, replace)
 
     torch.testing.assert_close(first[..., :-1, :], second[..., :-1, :], atol=0, rtol=0)
     assert not torch.equal(first[..., -1, :], second[..., -1, :])
+
+    predecessor_changed = token_ids.clone()
+    predecessor_changed[..., 1] = (predecessor_changed[..., 1] + 1) % 32
+    third = injection(hidden, 0, predecessor_changed, codes, replace)
+    torch.testing.assert_close(first[..., :2, :], third[..., :2, :], atol=0, rtol=0)
+    assert not torch.equal(first[..., 2, :], third[..., 2, :])
 
 
 def _randomize_injection(injection, seed=31):
@@ -189,6 +197,7 @@ def test_refine_matches_independent_equation():
     hidden = torch.randn(1, 2, 3, 16, generator=generator)
     predecessors = torch.randint(0, 32, (1, 2, 3), generator=generator)
     layer = len(model.draft_model.layers) - 1
+    _randomize_injection(model.draft_model.injection)
     actual = model.draft_model.refine(hidden, predecessors)
     import math
 
@@ -210,13 +219,16 @@ def test_refinement_loss_is_zero_for_equal_candidate_distributions():
     candidates = torch.tensor([[[4, 5, 6], [4, 5, 6]]])
     labels = torch.tensor([[4, 4]])
     weights = torch.ones_like(labels, dtype=torch.float32)
-    refinement, ref_ce, ref_l1 = refinement_loss(
+    supervised = torch.ones_like(labels, dtype=torch.float32)
+    refinement, ref_ce, ref_l1, ce_mass, l1_mass = refinement_loss(
         scores=scores, candidates=candidates, target_candidates=target,
         proposal_labels=labels, proposal_weights=weights,
+        proposal_supervised=supervised,
         ce_weight=0.1, mass_threshold=1e-4,
     )
     assert ref_l1 == 0
-    torch.testing.assert_close(refinement, 0.1 * ref_ce)
+    assert ce_mass == l1_mass == weights.sum()
+    torch.testing.assert_close(refinement, 0.1 * ref_ce * supervised.sum())
 
 
 def test_draft_forward_requires_a_block_or_dense_mask():
@@ -234,19 +246,66 @@ def test_draft_forward_requires_a_block_or_dense_mask():
 
 def test_block_mask_excludes_left_padding_but_keeps_valid_context():
     model = make_model()
-    anchors = torch.tensor([[4]])
-    keep = torch.ones(1, 1, dtype=torch.bool)
-    attention = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+    anchors = torch.tensor([[4], [4]])
+    keep = torch.ones(2, 1, dtype=torch.bool)
+    attention = torch.tensor([
+        [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    ])
     _, dense = model._block_mask(
-        anchors, keep, attention.shape[1], 1, attention_mask=attention
+        anchors, keep, attention.shape[1], 2, attention_mask=attention
     )
-    assert not dense[..., 0].any()
-    assert not dense[..., 1].any()
-    assert dense[..., 2].any()
+    assert dense.shape == (2, 4, 16)
+    assert not dense[0, :, 0].any()
+    assert not dense[0, :, 1].any()
+    assert dense[0, :, 2].any()
+    assert dense[1, :, 0].any()
     _, no_mask_dense = model._block_mask(
-        anchors, keep, attention.shape[1], 1, attention_mask=None
+        anchors, keep, attention.shape[1], 2, attention_mask=None
     )
     assert no_mask_dense[..., 0].any()
+
+
+def test_anchor_sampling_is_stable_under_left_and_right_padding():
+    block_size = 4
+    num_anchors = 2
+    real_length = 7
+    device = torch.device("cpu")
+    base_mask = torch.ones(1, real_length)
+    generator = torch.Generator(device=device).manual_seed(11)
+    base, base_keep = sample_anchor_positions(
+        real_length, base_mask, num_anchors, block_size, device,
+        generator=generator,
+    )
+
+    left_mask = torch.zeros(1, real_length + 5)
+    left_mask[:, 5:] = 1
+    left_attention = left_mask.clone()
+    generator = torch.Generator(device=device).manual_seed(11)
+    left, left_keep = sample_anchor_positions(
+        real_length + 5, left_mask, num_anchors, block_size, device,
+        generator=generator, attention_mask=left_attention,
+    )
+    assert left_keep.sum() == base_keep.sum() == num_anchors
+    assert (left[left_keep] - 5).tolist() == base[base_keep].tolist()
+
+    right_mask = torch.zeros(1, real_length + 5)
+    right_mask[:, :real_length] = 1
+    right_attention = right_mask.clone()
+    generator = torch.Generator(device=device).manual_seed(11)
+    right, right_keep = sample_anchor_positions(
+        real_length + 5, right_mask, num_anchors, block_size, device,
+        generator=generator, attention_mask=right_attention,
+    )
+    assert right_keep.sum() == base_keep.sum() == num_anchors
+    assert right[right_keep].tolist() == base[base_keep].tolist()
+
+
+def test_loss_terms_use_sequence_count_as_the_additive_denominator():
+    model = make_model()
+    inputs = make_inputs(batch=2)
+    *_, terms = model(**inputs, global_step=0, total_steps=1)
+    assert torch.equal(terms[1], torch.tensor(2.0))
 
 
 def test_packed_inputs_are_rejected_before_backbone():

@@ -24,25 +24,31 @@ from aspec.models.ops.flex_attention import compile_friendly_create_block_mask
 def refinement_loss(
     *, scores: torch.Tensor, candidates: torch.Tensor,
     target_candidates: torch.Tensor, proposal_labels: torch.Tensor,
-    proposal_weights: torch.Tensor, ce_weight: float, mass_threshold: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Candidate CE/L1 with the reference normalization and coverage mask."""
+    proposal_weights: torch.Tensor, proposal_supervised: torch.Tensor,
+    ce_weight: float, mass_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference refinement means, each normalized by its own eligible weight sum."""
     mass = target_candidates.sum(-1)
     covered = candidates == proposal_labels.unsqueeze(-1)
-    covered_any = covered.any(-1)
-    ref_ce = F.cross_entropy(
+    ce_mask = covered.any(-1)
+    ce_per = F.cross_entropy(
         scores.reshape(-1, candidates.shape[-1]),
         covered.long().argmax(-1).reshape(-1),
         reduction="none",
-    ).reshape(proposal_labels.shape)
-    ref_ce = (ref_ce * covered_any * proposal_weights).sum()
+    ).reshape(proposal_labels.shape) * ce_mask
     normalized_target = target_candidates / mass.clamp_min(1e-12).unsqueeze(-1)
-    ref_l1 = (
-        (torch.softmax(scores, dim=-1) - normalized_target).abs().sum(-1)
-        * (mass > mass_threshold)
-        * proposal_weights
-    ).sum()
-    return ce_weight * ref_ce + (1 - ce_weight) * ref_l1, ref_ce, ref_l1
+    l1_mask = mass > mass_threshold
+    l1_per = (
+        (torch.softmax(scores, dim=-1) - normalized_target).abs().sum(-1) * l1_mask
+    )
+    ce_mass = (ce_mask * proposal_weights).sum()
+    l1_mass = (l1_mask * proposal_weights).sum()
+    ce_mean = (ce_per * proposal_weights).sum() / ce_mass.clamp_min(1e-12)
+    l1_mean = (l1_per * proposal_weights).sum() / l1_mass.clamp_min(1e-12)
+    refinement = (
+        ce_weight * ce_mean + (1 - ce_weight) * l1_mean
+    ) * proposal_supervised.float().sum()
+    return refinement, ce_mean, l1_mean, ce_mass, l1_mass
 
 
 class DSpineModel(DFlashModel):
@@ -136,6 +142,7 @@ class DSpineModel(DFlashModel):
         draft_prefix=None,
         global_step: int = 0,
         total_steps: int | None = None,
+        alignment_ce: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         dict, Tuple[torch.Tensor, torch.Tensor],
@@ -182,9 +189,10 @@ class DSpineModel(DFlashModel):
         supervised = supervised[..., 1:].int().cumprod(dim=-1).bool()
         weights = supervised.float()
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            weights = weights * torch.exp(
-                -offsets[..., 1:].float() / self.loss_decay_gamma
+            proposal_depth = torch.arange(
+                self.block_size - 1, device=device, dtype=torch.float32
             )
+            weights = weights * torch.exp(-proposal_depth / self.loss_decay_gamma)
 
         if not bool(self.draft_model.transfer_ready):
             self.draft_model.initialize_transfer_space(lm_head_weight)
@@ -228,7 +236,7 @@ class DSpineModel(DFlashModel):
             reduction="none",
         ).reshape(proposal_labels.shape)
         flat_weights = proposal_weights.reshape(-1)
-        denominator = flat_weights.sum()
+        token_denominator = flat_weights.sum()
         ce = (ce_per_token * proposal_weights).sum()
 
         target_indices = (safe_indices[..., 1:] - 1).clamp_min(0)
@@ -244,7 +252,9 @@ class DSpineModel(DFlashModel):
         l1 = ((draft_probs - teacher_probs).abs().sum(-1) * proposal_weights).sum()
 
         config = self.draft_model.dspine_config
-        candidates = teacher_logits.topk(config.top_k, dim=-1).indices
+        # Inference refines the draft's own shortlist; the teacher only supplies
+        # probabilities for those candidate IDs.
+        candidates = draft_logits.topk(config.top_k, dim=-1).indices
         pre_injection = output.pre_injection[..., 1:, :].reshape(
             -1, self.block_size - 1, output.pre_injection.shape[-1]
         )
@@ -253,12 +263,13 @@ class DSpineModel(DFlashModel):
         candidate_embeds = F.embedding(candidates, lm_head_weight)
         scores = (refined.unsqueeze(-2) * candidate_embeds).sum(-1).float()
         target_candidates = teacher_probs.gather(-1, candidates)
-        refinement, ref_ce, ref_l1 = refinement_loss(
+        refinement, ref_ce, ref_l1, ref_ce_mass, ref_l1_mass = refinement_loss(
             scores=scores,
             candidates=candidates,
             target_candidates=target_candidates,
             proposal_labels=proposal_labels,
             proposal_weights=proposal_weights,
+            proposal_supervised=proposal_supervised,
             ce_weight=config.ce_weight,
             mass_threshold=config.candidate_mass_threshold,
         )
@@ -275,18 +286,20 @@ class DSpineModel(DFlashModel):
         alignment = 1 - F.cosine_similarity(
             layer_features.float(), reference_codes.unsqueeze(2), dim=-1
         )
-        alignment = (alignment * proposal_weights.unsqueeze(-1)).sum()
-        if denominator > 0:
-            alignment_ce = ce.detach() / denominator
-        else:
-            alignment_ce = ce.detach()
+        alignment = (alignment.mean(dim=-1) * proposal_weights).sum()
+        if alignment_ce is None:
+            alignment_ce = ce.detach() / token_denominator.clamp_min(1e-12)
+        alignment_ce = alignment_ce.detach()
         numerator = (
             config.ce_weight * ce
             + (1 - config.ce_weight) * l1
             + refinement
             + beta * alignment_ce * alignment
         )
-        loss = numerator / denominator.clamp_min(1e-6)
+        sequence_denominator = torch.tensor(
+            float(bsz), device=device, dtype=numerator.dtype
+        )
+        loss = numerator / sequence_denominator
 
         with torch.no_grad():
             binary = proposal_supervised.float()
@@ -308,10 +321,13 @@ class DSpineModel(DFlashModel):
             (proposal_weights.new_zeros(1), count_pp)
         )
         components = {
-            "dspine/backbone_ce": (ce.detach(), denominator.detach()),
-            "dspine/backbone_l1": (l1.detach(), denominator.detach()),
-            "dspine/refinement_loss": (refinement.detach(), denominator.detach()),
-            "dspine/alignment_loss": (alignment.detach(), denominator.detach()),
+            "dspine/backbone_ce": (ce.detach(), token_denominator.detach()),
+            "dspine/backbone_l1": (l1.detach(), token_denominator.detach()),
+            "dspine/refinement_ce": (ref_ce, ref_ce_mass),
+            "dspine/refinement_l1": (ref_l1, ref_l1_mass),
+            "dspine/refinement_loss": (refinement.detach(), sequence_denominator),
+            "dspine/alignment_loss": (alignment.detach(), token_denominator.detach()),
+            "dspine/alignment_ce": (alignment_ce, sequence_denominator),
             "dspine/replacement_probability": (
                 torch.tensor(replacement_probability, device=device),
                 torch.tensor(1.0, device=device),
@@ -319,5 +335,5 @@ class DSpineModel(DFlashModel):
         }
         return (
             loss, accuracy, loss_per_position, acc_per_position,
-            count_per_position, components, (numerator, denominator.detach()),
+            count_per_position, components, (numerator, sequence_denominator.detach()),
         )

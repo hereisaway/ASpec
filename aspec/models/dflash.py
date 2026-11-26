@@ -169,7 +169,7 @@ def _create_dflash_dense_mask(
             attention_mask.shape[0], kv_len, dtype=torch.bool, device=device
         )
         context_valid[:, :ctx_len] = attention_mask.to(device=device).bool()
-        mask_context = mask_context & context_valid.unsqueeze(0).unsqueeze(0)
+        mask_context = mask_context & context_valid.unsqueeze(1)
     is_draft = kv_index >= ctx_len
     kv_block = (kv_index - ctx_len) // block_size
     mask_draft = is_draft.unsqueeze(0).unsqueeze(0) & (

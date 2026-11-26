@@ -45,10 +45,19 @@ def _candidates(seq_len: int, loss_mask: torch.Tensor, block_size: int, device: 
         if attention_mask.shape != loss_mask.shape:
             raise ValueError("Anchor attention_mask and loss_mask must have identical shapes")
         # Padded BSHD rows must have the same candidate domain as their native
-        # unpadded documents. Physical batch/bucket padding is not context.
-        valid = valid & attention_mask[:, :num_candidates].bool() & attention_mask[
-            :, block_size - 1:block_size - 1 + num_candidates
-        ].bool() & attention_mask[:, block_size:block_size + 1].bool()
+        # unpadded documents. Physical batch/bucket padding is not context, so
+        # require the whole anchor block to lie inside each row's valid span.
+        mask = attention_mask.to(device=device).bool()
+        valid = valid & mask[:, :num_candidates]
+        if block_size > 1:
+            prefix = torch.cat(
+                (mask.new_zeros((mask.shape[0], 1)), mask.cumsum(dim=1)), dim=1
+            )
+            counts = (
+                prefix[:, block_size:block_size + num_candidates]
+                - prefix[:, :num_candidates]
+            )
+            valid = valid & (counts == block_size)
     indices = torch.arange(num_candidates, device=device).unsqueeze(0).expand(bsz, -1)
     return num_candidates, valid, valid.sum(dim=1), torch.where(valid, indices, seq_len + 1)
 
