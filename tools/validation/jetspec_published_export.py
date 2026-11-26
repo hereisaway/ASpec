@@ -27,6 +27,20 @@ from aspec.training.checkpoint import load_initial_draft_weights
 from tools import convert_to_hf
 
 
+def _validate_output_path(output: Path, checkpoint: Path, target_model: str | None) -> None:
+    output = output.expanduser().resolve()
+    protected = [("published checkpoint", checkpoint)]
+    if target_model is not None:
+        target = Path(target_model).expanduser()
+        if target.exists():
+            protected.append(("Target model", target.resolve()))
+    for label, path in protected:
+        if output == path or output.is_relative_to(path) or path.is_relative_to(output):
+            raise ValueError(
+                f"--output must not overlap the {label} directory: {path}"
+            )
+
+
 def export_published_jetspec(
     checkpoint: Path,
     output: Path,
@@ -43,6 +57,7 @@ def export_published_jetspec(
         )
     checkpoint = checkpoint.expanduser().resolve()
     output = output.expanduser().resolve()
+    _validate_output_path(output, checkpoint, target_model)
     config_path = checkpoint / "config.json"
     weights_path = checkpoint / "model.safetensors"
     if not config_path.is_file() or not weights_path.is_file():

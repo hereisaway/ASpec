@@ -213,6 +213,11 @@ def _serving_config(raw_config: dict) -> dict:
                 "SGLang JetSpec export cannot represent per-layer fc_norm; "
                 "use --format aspec"
             )
+        if effective.get("hidden_act", "silu") != "silu":
+            raise NotImplementedError(
+                "SGLang 0.5.21 DFlash loader only supports SiLU; "
+                "use --format aspec for another activation"
+            )
         # SGLang 0.5.21 reads top-level is_causal for DFlash full-attention
         # layers; it does not read dflash_config.causal_head.
         config["is_causal"] = True

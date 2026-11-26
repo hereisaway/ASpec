@@ -139,6 +139,23 @@ def test_jetspec_native_export_accepts_published_layout_config(tmp_path, monkeyp
         "aspec.draft_artifact.JetSpecConsumer"
     )
 
+def test_jetspec_serving_export_rejects_non_silu_activation():
+    with pytest.raises(NotImplementedError, match="SiLU"):
+        convert_to_hf._serving_config(_raw_config(hidden_act="gelu"))
+
+
+def test_published_export_harness_rejects_overlapping_output(tmp_path):
+    from tools.validation.jetspec_published_export import _validate_output_path
+
+    checkpoint = (tmp_path / "checkpoint").resolve()
+    target = (tmp_path / "target").resolve()
+    checkpoint.mkdir()
+    target.mkdir()
+    for output in (checkpoint, checkpoint / "asset", target, target / "asset"):
+        with pytest.raises(ValueError, match="must not overlap"):
+            _validate_output_path(output, checkpoint, str(target))
+
+
 def test_jetspec_native_export_rejects_semantics_that_disagree_with_checkpoint(
     tmp_path,
 ):

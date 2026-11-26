@@ -18,6 +18,51 @@ the published checkpoint through ASpec preserves the decode result.
 SGLang 0.5.21 reads the top-level `is_causal` flag for DFlash full-attention layers;
 `dflash_config.causal_head` alone leaves those layers bidirectional.
 
+## Direct published asset
+
+The "loaded directly" row did **not** use the stock published config. SGLang 0.5.21
+ignores `dflash_config.causal_head`, so the direct copy also needs top-level
+`is_causal=true`:
+
+```bash
+cp -r /models/jetspec-qwen3-8b /tmp/jetspec-direct
+python - <<'PY'
+import hashlib, json
+from pathlib import Path
+
+root = Path("/tmp/jetspec-direct")
+config = json.loads((root / "config.json").read_text())
+config["is_causal"] = True
+(root / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+def sha(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+manifest = {
+    "schema_version": "aspec.serving-export/v1",
+    "storage_format": "sglang",
+    "algorithm": "jetspec",
+    "model_sha256": sha(root / "model.safetensors"),
+    "config_sha256": sha(root / "config.json"),
+    "draft_structure": {"loader_contract": {
+        "runtime": "sglang", "validated_version": "0.5.21",
+        "speculative_algorithm": "DFLASH", "validation": "required_per_artifact",
+    }},
+}
+(root / "export_manifest.json").write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+)
+PY
+```
+
+Then run `aspec evaluate` on `/tmp/jetspec-direct`. The stock config alone is a
+bidirectional baseline and is not comparable to the causal ASpec export matching on
+these prompts; verifier equality alone does not prove the draft proposals were equal.
+
 ## Results
 
 | Draft | Acceptance length | Verifications | Median speedup | Greedy equal | Repeats stable |
@@ -30,8 +75,9 @@ Acceptance length follows `aspec evaluate`: completion tokens divided by real
 verifier calls, including Target tokens. Each repeat produced 512 completion tokens;
 the two repeats produced 1024 tokens total, which is the numerator used above.
 
-The ASpec-exported published checkpoint matched the directly loaded checkpoint's
-acceptance length, verification count and speedup in this bounded setup. That checks
+Both published-checkpoint rows used top-level `is_causal=true`. The ASpec-exported
+published checkpoint matched the directly loaded checkpoint's acceptance length,
+verification count and speedup in this bounded setup. That checks
 config/weight/layout compatibility; it does not establish convergence or a trained
 quality comparison.
 
