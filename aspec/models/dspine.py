@@ -93,7 +93,7 @@ class DSpineModel(DFlashModel):
             *packed_metadata,
         )
 
-    def _block_mask(self, anchors, keep, seq_len, batch):
+    def _block_mask(self, anchors, keep, seq_len, batch, attention_mask=None):
         draft_len = anchors.shape[1] * self.block_size
         if anchors.device.type == "cuda" and self.attention_backend == "flex_attention":
             mask_mod = _create_dflash_mask_mod(
@@ -102,6 +102,7 @@ class DSpineModel(DFlashModel):
                 ctx_len=seq_len,
                 block_size=self.block_size,
                 is_causal=True,
+                attention_mask=attention_mask,
             )
             return compile_friendly_create_block_mask(
                 mask_mod=mask_mod, B=batch, H=None,
@@ -113,7 +114,8 @@ class DSpineModel(DFlashModel):
                 "DSpine CPU/reference execution supports sdpa/eager only"
             )
         return None, _create_dflash_dense_mask(
-            anchors, keep, seq_len, self.block_size, is_causal=True
+            anchors, keep, seq_len, self.block_size, is_causal=True,
+            attention_mask=attention_mask,
         )
 
     def forward(
@@ -191,7 +193,9 @@ class DSpineModel(DFlashModel):
         context_pos, draft_pos = self._create_position_ids(
             anchors, seq_len, base_position_ids=base_position_ids
         )
-        block_mask, dense_mask = self._block_mask(anchors, keep, seq_len, bsz)
+        block_mask, dense_mask = self._block_mask(
+            anchors, keep, seq_len, bsz, attention_mask=attention_mask
+        )
         beta, replacement_probability = self.draft_model.dspine_config.schedule(
             int(global_step), total_steps
         )

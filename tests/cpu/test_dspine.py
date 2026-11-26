@@ -114,6 +114,7 @@ def test_adjacent_injection_does_not_leak_future_tokens_backwards():
         replacement_probability=0.0,
     )
     injection = AdjacentInjection(16, 1, options)
+    _randomize_injection(injection)
     generator = torch.Generator().manual_seed(11)
     hidden = torch.randn(1, 4, 16, generator=generator)
     token_ids = torch.randint(0, 32, (1, 4), generator=generator)
@@ -126,6 +127,16 @@ def test_adjacent_injection_does_not_leak_future_tokens_backwards():
 
     torch.testing.assert_close(first[..., :-1, :], second[..., :-1, :], atol=0, rtol=0)
     assert not torch.equal(first[..., -1, :], second[..., -1, :])
+
+
+def _randomize_injection(injection, seed=31):
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for write in injection.writes:
+            write.weight.copy_(torch.randn(write.weight.shape, generator=generator) * 0.1)
+        injection.predecessor_gate.weight.copy_(
+            torch.randn(injection.predecessor_gate.weight.shape, generator=generator) * 0.1
+        )
 
 
 def _reference_injection(injection, hidden, layer, token_ids, codes, replace):
@@ -159,6 +170,7 @@ def test_adjacent_injection_matches_independent_equation():
         replacement_probability=0.0,
     )
     injection = AdjacentInjection(16, 2, options)
+    _randomize_injection(injection)
     generator = torch.Generator().manual_seed(19)
     hidden = torch.randn(1, 2, 4, 16, generator=generator)
     token_ids = torch.randint(0, 32, (1, 2, 4), generator=generator)
@@ -205,6 +217,36 @@ def test_refinement_loss_is_zero_for_equal_candidate_distributions():
     )
     assert ref_l1 == 0
     torch.testing.assert_close(refinement, 0.1 * ref_ce)
+
+
+def test_draft_forward_requires_a_block_or_dense_mask():
+    model = make_model()
+    model.draft_model.initialize_transfer_space(torch.randn(32, 16))
+    with pytest.raises(ValueError, match="block_mask or draft_attention_mask"):
+        model.draft_model(
+            context_feature=torch.randn(1, 12, 16),
+            draft_position_ids=torch.zeros(1, 8, dtype=torch.long),
+            context_position_ids=torch.zeros(1, 12, dtype=torch.long),
+            noise_embedding=torch.randn(1, 8, 16),
+            block_token_ids=torch.randint(0, 32, (1, 2, 4)),
+        )
+
+
+def test_block_mask_excludes_left_padding_but_keeps_valid_context():
+    model = make_model()
+    anchors = torch.tensor([[4]])
+    keep = torch.ones(1, 1, dtype=torch.bool)
+    attention = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+    _, dense = model._block_mask(
+        anchors, keep, attention.shape[1], 1, attention_mask=attention
+    )
+    assert not dense[..., 0].any()
+    assert not dense[..., 1].any()
+    assert dense[..., 2].any()
+    _, no_mask_dense = model._block_mask(
+        anchors, keep, attention.shape[1], 1, attention_mask=None
+    )
+    assert no_mask_dense[..., 0].any()
 
 
 def test_packed_inputs_are_rejected_before_backbone():

@@ -274,6 +274,11 @@ class DSpineDraftModel(DFlashDraftModel):
         **kwargs,
     ) -> DSpineOutput:
         self._require_transfer_ready()
+        if block_mask is None and draft_attention_mask is None:
+            raise ValueError(
+                "DSpineDraftModel.forward requires block_mask or draft_attention_mask "
+                "to keep each block causal"
+            )
         if kwargs.pop("use_cache", False) or kwargs.pop("past_key_values", None) is not None:
             raise ValueError("DSpine reference forward requires explicit context without a draft KV cache")
         if block_token_ids is None:
