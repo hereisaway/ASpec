@@ -367,6 +367,7 @@ class DFlashModel(nn.Module):
                 )[2] if per_document else self.num_anchors),
                 block_size=self.block_size, ctx_doc_ids=ctx_doc_ids,
                 allow_partial_last_target=per_document,
+                attention_mask=attention_mask,
             )
         generator = None
         if self.deterministic_anchor_sampling:
@@ -869,6 +870,7 @@ class DFlashModel(nn.Module):
                             context_length=seq_len,
                             block_size=self.block_size,
                             ctx_doc_ids=ctx_doc_ids,
+                            attention_mask=attention_mask,
                             **options,
                         )
                     else:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
+from functools import partial
 from typing import NamedTuple
 
 import torch
@@ -176,11 +177,15 @@ class AdjacentInjection(nn.Module):
         token_ids: torch.Tensor,
         codes: torch.Tensor,
         replace: torch.Tensor | None = None,
+        replacement_layers: int | None = None,
     ) -> torch.Tensor:
         features = self.feature(hidden, layer)
         anchor = math.sqrt(self.rank) * F.embedding(token_ids[..., :1], codes)
         predecessors = torch.cat((anchor, features[..., 1:-1, :]), dim=-2)
-        if replace is not None and layer < self.replacement_layers:
+        effective_layers = (
+            self.replacement_layers if replacement_layers is None else replacement_layers
+        )
+        if replace is not None and layer < effective_layers:
             correct = math.sqrt(self.rank) * F.embedding(token_ids[..., :-1], codes)
             predecessors = torch.where(replace[..., None, None], correct, predecessors)
         successors = self.write(
@@ -292,7 +297,11 @@ class DSpineDraftModel(DFlashDraftModel):
         layer_features = []
         pre_injection = None
         for index, layer in enumerate(self.layers):
-            hidden = layer(
+            layer_forward = (
+                partial(self._gradient_checkpointing_func, layer)
+                if self.gradient_checkpointing and self.training else layer
+            )
+            hidden = layer_forward(
                 draft_hidden=hidden,
                 context_hidden=context_feature,
                 draft_position_ids=draft_position_ids,
@@ -304,6 +313,7 @@ class DSpineDraftModel(DFlashDraftModel):
             hidden = self.injection(
                 pre_injection, index, block_token_ids, self.transfer_codes,
                 replace_mask,
+                replacement_layers=self.dspine_config.replacement_layers,
             )
             layer_features.append(self.injection.feature(hidden, index))
             hidden = hidden.reshape(batch, blocks * size, -1)

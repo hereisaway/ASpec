@@ -13,7 +13,8 @@ from aspec.models.draft.dspine import (
     DSpineOptions,
 )
 from aspec.models.dspine import DSpineModel, refinement_loss
-from aspec.models.ops.anchors import sample_anchor_positions
+from aspec.models.ops.anchors import sample_anchor_positions, validate_injected_anchors
+from aspec.models.ops.cudnn_flex_attention import build_dspark_mla_mask
 
 
 def make_config(**overrides):
@@ -220,15 +221,41 @@ def test_refinement_loss_is_zero_for_equal_candidate_distributions():
     labels = torch.tensor([[4, 4]])
     weights = torch.ones_like(labels, dtype=torch.float32)
     supervised = torch.ones_like(labels, dtype=torch.float32)
-    refinement, ref_ce, ref_l1, ce_mass, l1_mass = refinement_loss(
+    (
+        refinement, ref_ce_sum, ref_l1_sum, ce_mass, l1_mass,
+        ref_ce_mean, ref_l1_mean,
+    ) = refinement_loss(
         scores=scores, candidates=candidates, target_candidates=target,
+        teacher_candidate_logits=scores,
         proposal_labels=labels, proposal_weights=weights,
         proposal_supervised=supervised,
         ce_weight=0.1, mass_threshold=1e-4,
     )
-    assert ref_l1 == 0
+    assert ref_l1_sum == 0
+    assert ref_l1_mean == 0
     assert ce_mass == l1_mass == weights.sum()
-    torch.testing.assert_close(refinement, 0.1 * ref_ce * supervised.sum())
+    torch.testing.assert_close(refinement, 0.1 * ref_ce_mean * supervised.sum())
+
+
+def test_refinement_conditional_target_uses_candidate_softmax_not_mass_floor():
+    # Teacher mass over the two candidates is tiny, but the conditional
+    # distribution of [0, 0] is exactly [0.5, 0.5].
+    teacher_probs = torch.tensor([[[1e-14, 1e-14, 1.0]]])
+    teacher_candidate_logits = torch.tensor([[[0.0, 0.0]]])
+    scores = torch.zeros(1, 1, 2)
+    candidates = torch.tensor([[[0, 1]]])
+    labels = torch.tensor([[0]])
+    weights = torch.ones_like(labels, dtype=torch.float32)
+    supervised = torch.ones_like(labels, dtype=torch.float32)
+    result = refinement_loss(
+        scores=scores, candidates=candidates,
+        target_candidates=teacher_probs.gather(-1, candidates),
+        teacher_candidate_logits=teacher_candidate_logits,
+        proposal_labels=labels, proposal_weights=weights,
+        proposal_supervised=supervised,
+        ce_weight=0.0, mass_threshold=0.0,
+    )
+    assert result[6] == 0
 
 
 def test_draft_forward_requires_a_block_or_dense_mask():
@@ -306,6 +333,93 @@ def test_loss_terms_use_sequence_count_as_the_additive_denominator():
     inputs = make_inputs(batch=2)
     *_, terms = model(**inputs, global_step=0, total_steps=1)
     assert torch.equal(terms[1], torch.tensor(2.0))
+
+
+def test_short_row_does_not_gain_anchors_from_a_longer_batch_neighbor():
+    block_size = 7
+    num_anchors = 2
+    loss_mask = torch.zeros(2, 12)
+    loss_mask[0, :7] = 1
+    loss_mask[1, :] = 1
+    attention = loss_mask.clone()
+    generator = torch.Generator(device="cpu").manual_seed(13)
+    anchors, keep = sample_anchor_positions(
+        12, loss_mask, num_anchors, block_size, torch.device("cpu"),
+        generator=generator, attention_mask=attention,
+    )
+    assert not keep[0].any()
+    assert keep[1].any()
+
+
+def test_explicit_anchor_validation_intersects_attention_and_loss_masks():
+    loss_mask = torch.ones(1, 5)
+    attention = torch.tensor([[1, 1, 0, 0, 0]])
+    with pytest.raises(ValueError, match="first targets must be supervised"):
+        validate_injected_anchors(
+            torch.tensor([[1]]), torch.tensor([[True]]),
+            loss_mask=loss_mask, num_anchors=1, block_size=3,
+            attention_mask=attention,
+        )
+
+
+def _cudnn_visible(mask_func, batch, query, key, query_length):
+    flat_query = batch * query_length + query
+    endpoints = mask_func[0, :, flat_query]
+    visible = key < int(endpoints[0])
+    for index in range(1, endpoints.numel(), 2):
+        visible |= int(endpoints[index]) <= key < int(endpoints[index + 1])
+    return visible
+
+
+def test_cudnn_mask_starts_context_at_first_valid_token():
+    mask = build_dspark_mla_mask(
+        anchor_positions=torch.tensor([[6]]),
+        block_keep_mask=torch.tensor([[True]]),
+        context_length=8,
+        block_size=4,
+        attention_mask=torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1]]),
+    )
+    assert _cudnn_visible(mask.mask_func, 0, 0, 5, 4)
+    assert not _cudnn_visible(mask.mask_func, 0, 0, 0, 4)
+
+
+def test_adjacent_injection_uses_current_replacement_layer_count():
+    options = DSpineOptions(
+        transfer_rank=8, message_size=8, top_k=4,
+        alignment_warmup_steps=0, replacement_layers=1,
+        replacement_probability=0.0,
+    )
+    injection = AdjacentInjection(16, 1, options)
+    _randomize_injection(injection)
+    generator = torch.Generator().manual_seed(29)
+    hidden = torch.randn(1, 1, 4, 16, generator=generator)
+    token_ids = torch.randint(0, 32, (1, 1, 4), generator=generator)
+    changed_tokens = token_ids.clone()
+    changed_tokens[..., 1] = (changed_tokens[..., 1] + 1) % 32
+    codes = torch.randn(32, 8, generator=generator)
+    replace = torch.ones(1, 1, dtype=torch.bool)
+    active = injection(hidden, 0, token_ids, codes, replace, replacement_layers=1)
+    disabled = injection(hidden, 0, token_ids, codes, replace, replacement_layers=0)
+    changed_disabled = injection(
+        hidden, 0, changed_tokens, codes, replace, replacement_layers=0
+    )
+    torch.testing.assert_close(disabled, changed_disabled, atol=0, rtol=0)
+    assert not torch.equal(active, disabled)
+
+
+def test_gradient_checkpointing_calls_the_parent_layer_hook(monkeypatch):
+    model = make_model()
+    model.train()
+    model.draft_model.gradient_checkpointing_enable()
+    calls = []
+
+    def checkpointed(func, *args, **kwargs):
+        calls.append(1)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(model.draft_model, "_gradient_checkpointing_func", checkpointed)
+    model(**make_inputs(), global_step=0, total_steps=1)
+    assert len(calls) == model.draft_model.num_layers
 
 
 def test_packed_inputs_are_rejected_before_backbone():
