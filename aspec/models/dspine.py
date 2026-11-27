@@ -25,10 +25,13 @@ def refinement_loss(
     *, scores: torch.Tensor, candidates: torch.Tensor,
     target_candidates: torch.Tensor, teacher_candidate_logits: torch.Tensor,
     proposal_labels: torch.Tensor, proposal_weights: torch.Tensor,
-    proposal_supervised: torch.Tensor, ce_weight: float, mass_threshold: float,
+    proposal_supervised: torch.Tensor, sequence_shape: tuple[int, ...],
+    ce_weight: float, mass_threshold: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor]:
-    """Reference refinement sums/means with full-vocab mass and conditional targets."""
+    """Sequence-local refinement reduction with full-vocab eligibility mass."""
+    tokens = proposal_labels.shape[-1]
+    shape = (*sequence_shape, tokens)
     mass = target_candidates.sum(-1)
     covered = candidates == proposal_labels.unsqueeze(-1)
     ce_mask = covered.any(-1)
@@ -44,15 +47,29 @@ def refinement_loss(
     l1_per = (
         (torch.softmax(scores, dim=-1) - conditional).abs().sum(-1) * l1_mask
     )
-    ce_mass = (ce_mask * proposal_weights).sum()
-    l1_mass = (l1_mask * proposal_weights).sum()
-    ce_sum = (ce_per * proposal_weights).sum()
-    l1_sum = (l1_per * proposal_weights).sum()
+    ce_per = ce_per.reshape(shape)
+    l1_per = l1_per.reshape(shape)
+    weights = proposal_weights.reshape(shape)
+    ce_mask = ce_mask.reshape(shape)
+    l1_mask = l1_mask.reshape(shape)
+    supervised = proposal_supervised.reshape(shape).float()
+    reduce_dims = tuple(range(1, len(shape)))
+    ce_mass_seq = (ce_mask * weights).sum(dim=reduce_dims)
+    l1_mass_seq = (l1_mask * weights).sum(dim=reduce_dims)
+    ce_sum_seq = (ce_per * weights).sum(dim=reduce_dims)
+    l1_sum_seq = (l1_per * weights).sum(dim=reduce_dims)
+    ce_mean_seq = ce_sum_seq / ce_mass_seq.clamp_min(1e-12)
+    l1_mean_seq = l1_sum_seq / l1_mass_seq.clamp_min(1e-12)
+    refinement = (
+        (ce_weight * ce_mean_seq + (1 - ce_weight) * l1_mean_seq)
+        * supervised.sum(dim=reduce_dims)
+    ).sum()
+    ce_sum = ce_sum_seq.sum()
+    l1_sum = l1_sum_seq.sum()
+    ce_mass = ce_mass_seq.sum()
+    l1_mass = l1_mass_seq.sum()
     ce_mean = ce_sum / ce_mass.clamp_min(1e-12)
     l1_mean = l1_sum / l1_mass.clamp_min(1e-12)
-    refinement = (
-        ce_weight * ce_mean + (1 - ce_weight) * l1_mean
-    ) * proposal_supervised.float().sum()
     return (refinement, ce_sum, l1_sum, ce_mass, l1_mass, ce_mean, l1_mean)
 
 
@@ -285,6 +302,7 @@ class DSpineModel(DFlashModel):
             proposal_labels=proposal_labels,
             proposal_weights=proposal_weights,
             proposal_supervised=proposal_supervised,
+            sequence_shape=(bsz, n_blocks),
             ce_weight=config.ce_weight,
             mass_threshold=config.candidate_mass_threshold,
         )

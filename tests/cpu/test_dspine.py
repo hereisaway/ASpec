@@ -229,6 +229,7 @@ def test_refinement_loss_is_zero_for_equal_candidate_distributions():
         teacher_candidate_logits=scores,
         proposal_labels=labels, proposal_weights=weights,
         proposal_supervised=supervised,
+        sequence_shape=(1, 1),
         ce_weight=0.1, mass_threshold=1e-4,
     )
     assert ref_l1_sum == 0
@@ -253,6 +254,7 @@ def test_refinement_conditional_target_uses_candidate_softmax_not_mass_floor():
         teacher_candidate_logits=teacher_candidate_logits,
         proposal_labels=labels, proposal_weights=weights,
         proposal_supervised=supervised,
+        sequence_shape=(1, 1),
         ce_weight=0.0, mass_threshold=0.0,
     )
     assert result[6] == 0
@@ -383,6 +385,23 @@ def test_cudnn_mask_starts_context_at_first_valid_token():
     assert not _cudnn_visible(mask.mask_func, 0, 0, 0, 4)
 
 
+def test_cudnn_mask_broadcasts_two_rows_and_anchors_with_padding():
+    mask = build_dspark_mla_mask(
+        anchor_positions=torch.tensor([[2, 5], [3, 6]]),
+        block_keep_mask=torch.ones(2, 2, dtype=torch.bool),
+        context_length=8,
+        block_size=2,
+        attention_mask=torch.tensor([
+            [1, 1, 1, 1, 1, 1, 0, 0],
+            [0, 0, 1, 1, 1, 1, 1, 1],
+        ]),
+    )
+    query_length = 4
+    assert _cudnn_visible(mask.mask_func, 0, 0, 0, query_length)
+    assert not _cudnn_visible(mask.mask_func, 1, 0, 0, query_length)
+    assert _cudnn_visible(mask.mask_func, 1, 0, 2, query_length)
+
+
 def test_adjacent_injection_uses_current_replacement_layer_count():
     options = DSpineOptions(
         transfer_rank=8, message_size=8, top_k=4,
@@ -405,6 +424,33 @@ def test_adjacent_injection_uses_current_replacement_layer_count():
     )
     torch.testing.assert_close(disabled, changed_disabled, atol=0, rtol=0)
     assert not torch.equal(active, disabled)
+
+
+def test_fixed_alignment_coefficient_is_additive_across_microbatches():
+    model = make_model()
+    inputs = make_inputs(batch=2)
+    anchors = torch.tensor([[2, 6], [3, 7]])
+    keep = torch.ones_like(anchors, dtype=torch.bool)
+    coefficient = torch.tensor(0.7)
+    keys = [name for name in inputs if name != "lm_head_weight"]
+
+    def run(rows, batch_anchors, batch_keep):
+        data = {
+            name: (inputs[name] if rows is None else inputs[name][rows])
+            for name in keys
+        }
+        data["lm_head_weight"] = inputs["lm_head_weight"]
+        return model(
+            **data, injected_anchors=batch_anchors,
+            injected_keep_mask=batch_keep, global_step=0, total_steps=1,
+            alignment_ce=coefficient,
+        )[-1]
+
+    combined = run(None, anchors, keep)
+    first = run(slice(0, 1), anchors[:1], keep[:1])
+    second = run(slice(1, 2), anchors[1:], keep[1:])
+    torch.testing.assert_close(combined[0], first[0] + second[0], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(combined[1], first[1] + second[1], atol=0, rtol=0)
 
 
 def test_gradient_checkpointing_calls_the_parent_layer_hook(monkeypatch):

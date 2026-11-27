@@ -134,18 +134,15 @@ def build_dspark_mla_mask(
             raise NotImplementedError(
                 "cuDNN DFlash masks require contiguous valid context spans"
             )
-        valid = valid & any_valid[:, None].repeat_interleave(block_size, dim=1)
-        valid = valid & (
-            query_anchors <= ends[:, None].repeat_interleave(block_size, dim=1)
-        )
-        context_begin = torch.maximum(
-            context_begin, starts[:, None].repeat_interleave(block_size, dim=1)
-        )
+        valid = valid & any_valid[:, None]
+        valid = valid & (query_anchors <= ends[:, None])
+        context_begin = torch.maximum(context_begin, starts[:, None])
     if ctx_doc_ids is not None:
         run_starts = _document_run_starts(ctx_doc_ids)
-        context_begin = torch.gather(run_starts, 1, anchors).repeat_interleave(
+        document_begin = torch.gather(run_starts, 1, anchors).repeat_interleave(
             block_size, dim=1
         )
+        context_begin = torch.maximum(context_begin, document_begin)
         anchor_docs = torch.gather(ctx_doc_ids, 1, anchors).repeat_interleave(
             block_size, dim=1
         )
